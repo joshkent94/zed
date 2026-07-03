@@ -1245,6 +1245,26 @@ fn appearance_page() -> SettingsPage {
         ]
     }
 
+    fn motion_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Motion"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Reduce Motion",
+                description: "Whether to reduce non-essential motion, such as loading spinners, by rendering them in a static state.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("reduce_motion"),
+                    pick: |settings_content| settings_content.reduce_motion.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.reduce_motion = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     fn cursor_section() -> [SettingsPageItem; 5] {
         [
             SettingsPageItem::SectionHeader("Cursor"),
@@ -1453,6 +1473,7 @@ fn appearance_page() -> SettingsPage {
         agent_panel_font_section(),
         markdown_preview_font_section(),
         text_rendering_section(),
+        motion_section(),
         cursor_section(),
         highlighting_section(),
         guides_section(),

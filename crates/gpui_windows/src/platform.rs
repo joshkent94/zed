@@ -732,6 +732,10 @@ impl Platform for WindowsPlatform {
         should_auto_hide_scrollbars().log_err().unwrap_or(false)
     }
 
+    fn should_reduce_motion(&self) -> bool {
+        should_reduce_motion().log_err().unwrap_or(false)
+    }
+
     fn write_to_clipboard(&self, item: ClipboardItem) {
         write_to_clipboard(item);
     }
@@ -1285,6 +1289,14 @@ fn load_icon() -> Result<HICON> {
 fn should_auto_hide_scrollbars() -> Result<bool> {
     let ui_settings = UISettings::new()?;
     Ok(ui_settings.AutoHideScrollBars()?)
+}
+
+// Reflects the "Animation effects" accessibility toggle, which is also what
+// browsers map to `prefers-reduced-motion` on Windows.
+#[inline]
+fn should_reduce_motion() -> Result<bool> {
+    let ui_settings = UISettings::new()?;
+    Ok(!ui_settings.AnimationsEnabled()?)
 }
 
 fn check_device_lost(device: &ID3D11Device) -> bool {

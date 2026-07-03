@@ -332,6 +332,14 @@ impl Platform for WebPlatform {
         true
     }
 
+    fn should_reduce_motion(&self) -> bool {
+        self.browser_window
+            .match_media("(prefers-reduced-motion: reduce)")
+            .ok()
+            .flatten()
+            .is_some_and(|query| query.matches())
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         None
     }

@@ -119,6 +119,7 @@ pub(crate) struct LinuxCommon {
     pub(crate) text_system: Arc<dyn PlatformTextSystem>,
     pub(crate) appearance: WindowAppearance,
     pub(crate) auto_hide_scrollbars: bool,
+    pub(crate) reduce_motion: bool,
     pub(crate) button_layout: WindowButtonLayout,
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
@@ -159,6 +160,7 @@ impl LinuxCommon {
             text_system,
             appearance: WindowAppearance::Light,
             auto_hide_scrollbars: false,
+            reduce_motion: false,
             button_layout: WindowButtonLayout::linux_default(),
             callbacks,
             signal,
@@ -614,6 +616,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn should_auto_hide_scrollbars(&self) -> bool {
         self.inner.with_common(|common| common.auto_hide_scrollbars)
+    }
+
+    fn should_reduce_motion(&self) -> bool {
+        self.inner.with_common(|common| common.reduce_motion)
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {

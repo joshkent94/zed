@@ -216,6 +216,10 @@ impl Platform for VisualTestPlatform {
         self.platform.should_auto_hide_scrollbars()
     }
 
+    fn should_reduce_motion(&self) -> bool {
+        self.platform.should_reduce_motion()
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.clipboard.lock().clone()
     }

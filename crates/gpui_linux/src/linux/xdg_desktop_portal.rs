@@ -16,6 +16,7 @@ pub enum Event {
     #[cfg_attr(feature = "x11", allow(dead_code))]
     CursorSize(u32),
     ButtonLayout(String),
+    ReduceMotion(bool),
 }
 
 pub struct XDPEventSource {
@@ -57,6 +58,13 @@ impl XDPEventSource {
                     .await
                 {
                     sender.send(Event::ButtonLayout(initial_layout))?;
+                }
+
+                if let Ok(animations_enabled) = settings
+                    .read::<bool>("org.gnome.desktop.interface", "enable-animations")
+                    .await
+                {
+                    sender.send(Event::ReduceMotion(!animations_enabled))?;
                 }
 
                 if let Ok(mut cursor_theme_changed) = settings
@@ -110,6 +118,27 @@ impl XDPEventSource {
                             while let Some(layout) = button_layout_changed.next().await {
                                 let layout = layout?;
                                 sender.send(Event::ButtonLayout(layout))?;
+                            }
+                            anyhow::Ok(())
+                        })
+                        .detach();
+                }
+
+                if let Ok(mut animations_enabled_changed) = settings
+                    .receive_setting_changed_with_args::<bool>(
+                        "org.gnome.desktop.interface",
+                        "enable-animations",
+                    )
+                    .await
+                {
+                    let sender = sender.clone();
+                    background
+                        .spawn(async move {
+                            while let Some(animations_enabled) =
+                                animations_enabled_changed.next().await
+                            {
+                                let animations_enabled = animations_enabled?;
+                                sender.send(Event::ReduceMotion(!animations_enabled))?;
                             }
                             anyhow::Ok(())
                         })
