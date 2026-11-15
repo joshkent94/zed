@@ -9811,12 +9811,13 @@ impl Repository {
 
     pub fn remove_worktree(&mut self, path: PathBuf, force: bool) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
+        let this = self.this.clone();
         let repository_anchor_path: Arc<Path> = self.linked_worktree_anchor_path().into();
         self.send_job(
             "remove_worktree",
             Some(format!("git worktree remove: {}", path.display()).into()),
-            move |repo, cx| async move {
-                match repo {
+            move |repo, mut cx| async move {
+                let removed: Result<()> = match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, fs, .. }) => {
                         // When forcing, delete the worktree directory ourselves before
                         // invoking git. `git worktree remove` can remove the admin
@@ -9886,7 +9887,26 @@ impl Repository {
 
                         Ok(())
                     }
-                }
+                };
+                removed?;
+
+                // The scan that refreshes the snapshot is triggered by a file watcher and
+                // runs later, so the removed worktree would otherwise still be listed.
+                this.update(&mut cx, |this, cx| {
+                    let linked_worktrees: Arc<[GitWorktree]> = this
+                        .snapshot
+                        .linked_worktrees
+                        .iter()
+                        .filter(|worktree| worktree.path != path)
+                        .cloned()
+                        .collect();
+                    if linked_worktrees.len() != this.snapshot.linked_worktrees.len() {
+                        this.snapshot.linked_worktrees = linked_worktrees;
+                        cx.emit(RepositoryEvent::GitWorktreeListChanged);
+                    }
+                })
+                .log_err();
+                Ok(())
             },
         )
     }

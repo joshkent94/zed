@@ -278,12 +278,14 @@ pub struct ProjectGroup {
 pub struct SerializedProjectGroupState {
     pub key: ProjectGroupKey,
     pub expanded: bool,
+    pub custom_name: Option<SharedString>,
 }
 
 #[derive(Clone)]
 pub struct ProjectGroupState {
     pub key: ProjectGroupKey,
     pub expanded: bool,
+    pub custom_name: Option<SharedString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -692,6 +694,7 @@ impl MultiWorkspace {
             ProjectGroupState {
                 key,
                 expanded: true,
+                custom_name: None,
             },
         );
     }
@@ -729,12 +732,19 @@ impl MultiWorkspace {
 
         if new_key_exists {
             let active_key = self.workspace().read(cx).project_group_key(cx);
-            if active_key == *new_key {
-                self.project_groups.retain(|g| g.key != *old_key);
+            let (winner, loser) = if active_key == *new_key {
+                (new_key, old_key)
             } else {
-                self.project_groups.retain(|g| g.key != *new_key);
-                if let Some(group) = self.project_groups.iter_mut().find(|g| g.key == *old_key) {
-                    group.key = new_key.clone();
+                (old_key, new_key)
+            };
+            let loser_name = self
+                .group_state_by_key(loser)
+                .and_then(|group| group.custom_name.clone());
+            self.project_groups.retain(|g| g.key != *loser);
+            if let Some(group) = self.project_groups.iter_mut().find(|g| g.key == *winner) {
+                group.key = new_key.clone();
+                if group.custom_name.is_none() {
+                    group.custom_name = loser_name;
                 }
             }
         } else {
@@ -839,14 +849,23 @@ impl MultiWorkspace {
         _cx: &mut Context<Self>,
     ) {
         let mut restored: Vec<ProjectGroupState> = Vec::new();
-        for SerializedProjectGroupState { key, expanded } in groups {
+        for SerializedProjectGroupState {
+            key,
+            expanded,
+            custom_name,
+        } in groups
+        {
             if key.path_list().paths().is_empty() {
                 continue;
             }
             if restored.iter().any(|group| group.key == key) {
                 continue;
             }
-            restored.push(ProjectGroupState { key, expanded });
+            restored.push(ProjectGroupState {
+                key,
+                expanded,
+                custom_name,
+            });
         }
         for existing in std::mem::take(&mut self.project_groups) {
             if !restored.iter().any(|group| group.key == existing.key) {
@@ -921,6 +940,32 @@ impl MultiWorkspace {
             return false;
         }
         self.project_groups.swap(index - 1, index);
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+        true
+    }
+
+    /// Moves the group for `key` into the position held by `target_key`.
+    pub fn move_project_group_to(
+        &mut self,
+        key: &ProjectGroupKey,
+        target_key: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let position = |key: &ProjectGroupKey| {
+            self.project_groups
+                .iter()
+                .position(|group| group.key == *key)
+        };
+        let (Some(from), Some(to)) = (position(key), position(target_key)) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        let group = self.project_groups.remove(from);
+        self.project_groups.insert(to, group);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
         self.serialize(cx);
         cx.notify();
@@ -1496,6 +1541,7 @@ impl MultiWorkspace {
                     crate::persistence::model::SerializedProjectGroup::from_group(
                         &group.key,
                         group.expanded,
+                        group.custom_name.clone(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -1677,6 +1723,7 @@ impl MultiWorkspace {
         self.project_groups.push(ProjectGroupState {
             key: group.key,
             expanded: group.expanded,
+            custom_name: None,
         });
     }
 

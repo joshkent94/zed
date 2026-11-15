@@ -6932,6 +6932,22 @@ impl ProjectGroupKey {
         &self.paths
     }
 
+    pub fn path_detail_map<'a>(
+        keys: impl IntoIterator<Item = &'a ProjectGroupKey>,
+    ) -> std::collections::HashMap<PathBuf, usize> {
+        let mut all_paths: Vec<PathBuf> = keys
+            .into_iter()
+            .flat_map(|key| key.paths.paths().iter().cloned())
+            .collect();
+        all_paths.sort_unstable();
+        all_paths.dedup();
+        let path_details =
+            util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
+                path_suffix(path, detail)
+            });
+        all_paths.into_iter().zip(path_details).collect()
+    }
+
     pub fn display_name(
         &self,
         path_detail_map: &std::collections::HashMap<PathBuf, usize>,
@@ -6954,7 +6970,7 @@ impl ProjectGroupKey {
         if names.is_empty() {
             "Empty Workspace".into()
         } else {
-            names.join(", ").into()
+            names.join(" / ").into()
         }
     }
 

@@ -247,7 +247,7 @@ impl ConfigOptionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Entity<ConfigOptionSelector>> {
-        config_options
+        let options = config_options
             .config_options()
             .into_iter()
             .filter(|option| {
@@ -256,6 +256,16 @@ impl ConfigOptionsView {
                     acp::SessionConfigKind::Select(_) | acp::SessionConfigKind::Boolean(_)
                 )
             })
+            .collect();
+        let options = match agent_server.agent_id().0.as_ref() {
+            agent_servers::CLAUDE_AGENT_ID => {
+                ordered_config_options(options, &CLAUDE_CONFIG_OPTION_ORDER)
+            }
+            agent_servers::CODEX_ID => ordered_config_options(options, &CODEX_CONFIG_OPTION_ORDER),
+            _ => options,
+        };
+        options
+            .into_iter()
             .map(|option| {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
@@ -273,6 +283,24 @@ impl ConfigOptionsView {
             })
             .collect()
     }
+}
+
+// Options render right to left, so these show model, effort, mode, fast.
+const CLAUDE_CONFIG_OPTION_ORDER: [&str; 4] = ["fast", "mode", "effort", "model"];
+const CODEX_CONFIG_OPTION_ORDER: [&str; 4] = ["fast-mode", "mode", "reasoning_effort", "model"];
+
+fn ordered_config_options(
+    mut options: Vec<acp::SessionConfigOption>,
+    order: &[&str],
+) -> Vec<acp::SessionConfigOption> {
+    let position = |option: &acp::SessionConfigOption| {
+        order
+            .iter()
+            .position(|config_id| *config_id == option.config_id.0.as_ref())
+    };
+    options.retain(|option| position(option).is_some());
+    options.sort_by_key(position);
+    options
 }
 
 impl Render for ConfigOptionsView {
@@ -1169,6 +1197,19 @@ mod tests {
     use parking_lot::Mutex;
     use project::{AgentId, Project};
     use std::{any::Any, cell::RefCell};
+
+    #[test]
+    fn config_options_are_filtered_and_ordered() {
+        let options = ["mode", "model", "effort", "fast", "ultracode", "agent"]
+            .into_iter()
+            .map(|config_id| acp::SessionConfigOption::boolean(config_id, config_id, false))
+            .collect();
+        let config_ids = ordered_config_options(options, &CLAUDE_CONFIG_OPTION_ORDER)
+            .into_iter()
+            .map(|option| option.config_id.0.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(config_ids, ["fast", "mode", "effort", "model"]);
+    }
 
     fn option_names(options: Vec<ConfigOptionValue>) -> Vec<String> {
         options.into_iter().map(|option| option.name).collect()

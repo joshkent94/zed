@@ -1526,6 +1526,69 @@ mod git_worktrees {
     }
 
     #[gpui::test]
+    async fn test_remove_worktree_updates_snapshot_before_resolving(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+
+        let worktree_path = PathBuf::from(path!("/worktrees/root/feature/root"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "feature".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        fs.with_git_state(path!("/root/.git").as_ref(), true, |_| {})
+            .unwrap();
+        cx.executor().run_until_parked();
+        let lists_worktree = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| {
+                repository
+                    .snapshot()
+                    .linked_worktrees()
+                    .iter()
+                    .any(|worktree| worktree.path == worktree_path)
+            })
+        };
+        assert!(lists_worktree(cx));
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.remove_worktree(worktree_path.clone(), false)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // No scan has run yet: the removal itself must drop the worktree from the snapshot.
+        assert!(!lists_worktree(cx));
+    }
+
+    #[gpui::test]
     async fn test_remove_worktree_uses_bare_repository_identity_for_managed_parent_directories(
         cx: &mut TestAppContext,
     ) {

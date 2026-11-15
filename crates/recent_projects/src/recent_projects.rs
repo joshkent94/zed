@@ -778,6 +778,7 @@ pub struct RecentProjectsDelegate {
     workspace: WeakEntity<Workspace>,
     open_folders: Vec<OpenFolderEntry>,
     window_project_groups: Vec<ProjectGroupKey>,
+    project_group_labels: Vec<SharedString>,
     workspaces: Vec<RecentWorkspace>,
     filtered_entries: Vec<ProjectPickerEntry>,
     selected_index: usize,
@@ -803,6 +804,7 @@ impl RecentProjectsDelegate {
             workspace,
             open_folders,
             window_project_groups,
+            project_group_labels: Vec::new(),
             workspaces: Vec::new(),
             filtered_entries: Vec::new(),
             selected_index: 0,
@@ -813,6 +815,21 @@ impl RecentProjectsDelegate {
             style,
             actions_menu_handle: PopoverMenuHandle::default(),
         }
+    }
+
+    fn compute_project_group_labels(&self, window: &Window, cx: &App) -> Vec<SharedString> {
+        let path_detail_map = ProjectGroupKey::path_detail_map(&self.window_project_groups);
+        let multi_workspace = window.root::<MultiWorkspace>().flatten();
+        self.window_project_groups
+            .iter()
+            .map(|key| {
+                multi_workspace
+                    .as_ref()
+                    .and_then(|multi_workspace| multi_workspace.read(cx).group_state_by_key(key))
+                    .and_then(|state| state.custom_name.clone())
+                    .unwrap_or_else(|| key.display_name(&path_detail_map))
+            })
+            .collect()
     }
 
     pub fn set_workspaces(&mut self, workspaces: Vec<RecentWorkspace>) {
@@ -888,7 +905,7 @@ impl PickerDelegate for RecentProjectsDelegate {
     fn update_matches(
         &mut self,
         query: String,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> gpui::Task<()> {
         let query = query.trim_start();
@@ -911,17 +928,18 @@ impl PickerDelegate for RecentProjectsDelegate {
             match_strings(&candidates, query, match_options)
         };
 
+        self.project_group_labels = self.compute_project_group_labels(window, cx);
         let project_group_candidates: Vec<_> = self
-            .window_project_groups
+            .project_group_labels
             .iter()
+            .zip(&self.window_project_groups)
             .enumerate()
-            .map(|(id, key)| {
-                let combined_string = key
-                    .path_list()
-                    .ordered_paths()
-                    .map(|path| path.compact().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .concat();
+            .map(|(id, (label, key))| {
+                // The paths are matched too, as a label may be a custom name.
+                let mut combined_string = label.to_string();
+                for path in key.path_list().ordered_paths() {
+                    combined_string.push_str(&path.compact().to_string_lossy());
+                }
                 StringMatchCandidate::new(id, &combined_string)
             })
             .collect();
@@ -1272,25 +1290,39 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let show_icon = self.filtered_entries_include_remote_project();
                 let path_style = self.path_style_for_project_group(key, window, cx);
 
-                let mut path_start_offset = 0;
-                let (match_labels, path_highlights): (Vec<_>, Vec<_>) = paths
+                let label = self
+                    .project_group_labels
+                    .get(hit.candidate_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut path_start_offset = label.len();
+                let path_highlights = paths
                     .ordered_paths()
-                    .map(|p| p.compact())
                     .map(|path| {
-                        let highlighted_text = highlights_for_path(
-                            path.as_ref(),
+                        let highlighted_path = highlights_for_path(
+                            path.compact().as_ref(),
                             path_style,
                             &hit.positions,
                             path_start_offset,
-                        );
-                        path_start_offset += highlighted_text.1.text.len();
-                        highlighted_text
+                        )
+                        .1;
+                        path_start_offset += highlighted_path.text.len();
+                        highlighted_path
                     })
-                    .unzip();
+                    .collect();
 
                 let highlighted_match = HighlightedMatchWithPaths {
                     prefix: None,
-                    match_label: HighlightedMatch::join(match_labels.into_iter(), ", "),
+                    match_label: HighlightedMatch {
+                        text: label.to_string(),
+                        highlight_positions: hit
+                            .positions
+                            .iter()
+                            .copied()
+                            .filter(|position| *position < label.len())
+                            .collect(),
+                        color: Color::Default,
+                    },
                     paths: path_highlights,
                     active: is_active,
                 };

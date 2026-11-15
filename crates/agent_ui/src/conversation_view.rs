@@ -817,6 +817,7 @@ pub struct ConversationView {
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
     server_state: ServerState,
     recovery: Option<ThreadRecovery>,
+    has_connected: bool,
     saved_submissions: Vec<SavedSubmission>,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
@@ -1148,6 +1149,7 @@ impl ConversationView {
                 cx,
             ),
             recovery: None,
+            has_connected: false,
             saved_submissions: Vec::new(),
             pending_selections: Vec::new(),
             notifications: Vec::new(),
@@ -1191,6 +1193,7 @@ impl ConversationView {
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
+            self.has_connected = true;
             cx.emit(RootThreadUpdated);
         }
         cx.notify();
@@ -1865,6 +1868,19 @@ impl ConversationView {
 
     pub fn agent_key(&self) -> &Agent {
         &self.connection_key
+    }
+
+    pub(crate) fn project(&self) -> &Entity<Project> {
+        &self.project
+    }
+
+    pub(crate) fn has_connected(&self) -> bool {
+        self.has_connected
+    }
+
+    /// A lost connection also ends in a load error, but leaves input worth keeping.
+    pub(crate) fn failed_to_start(&self) -> bool {
+        !self.has_connected && matches!(self.server_state, ServerState::LoadError { .. })
     }
 
     /// User renames are stored in ThreadMetadataStore.
@@ -7990,6 +8006,91 @@ pub(crate) mod tests {
                 "Expected refusal error to be set"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_new_thread_is_listed_until_its_session_fails_to_start(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "src": {} })).await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(FailingAgentServer),
+                    connection_store.clone(),
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+        let is_listed = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::thread_metadata_store::ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some()
+            })
+        };
+        assert!(is_listed(cx), "listed before the session exists");
+
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| assert!(view.failed_to_start()));
+        assert!(!is_listed(cx), "discarded once the session failed to start");
+    }
+
+    #[gpui::test]
+    async fn test_draft_stays_listed_when_its_connection_is_lost(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+        let is_listed = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::thread_metadata_store::ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some()
+            })
+        };
+        assert!(is_listed(cx));
+
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::LoadError(LoadError::Other(
+                "connection lost".into(),
+            )));
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, _| {
+            assert!(matches!(view.server_state, ServerState::LoadError { .. }));
+        });
+        assert!(
+            is_listed(cx),
+            "typed input may not be persisted yet when a connection is lost"
+        );
     }
 
     #[gpui::test]

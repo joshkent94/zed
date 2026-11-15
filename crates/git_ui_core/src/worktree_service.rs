@@ -755,6 +755,26 @@ pub fn create_worktree_workspace(
     )
 }
 
+/// Same as [`create_worktree_workspace`], but the new workspace is activated and
+/// inherits the source workspace's layout, like [`handle_create_worktree`].
+pub fn create_worktree_workspace_and_activate(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
+        workspace,
+        action,
+        window,
+        fallback_focused_dock,
+        RemoteBranchFetchMode::Fetch,
+        true,
+        cx,
+    )
+}
+
 fn create_worktree_workspace_inner(
     workspace: &mut Workspace,
     action: &zed_actions::CreateWorktree,

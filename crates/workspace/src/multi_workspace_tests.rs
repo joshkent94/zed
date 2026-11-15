@@ -1244,10 +1244,12 @@ async fn test_remove_project_group_replaces_unretained_active_workspace(cx: &mut
                 SerializedProjectGroupState {
                     key: key_a.clone(),
                     expanded: true,
+                    custom_name: None,
                 },
                 SerializedProjectGroupState {
                     key: remote_key.clone(),
                     expanded: true,
+                    custom_name: None,
                 },
             ],
             cx,

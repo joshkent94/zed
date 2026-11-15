@@ -1744,8 +1744,7 @@ impl AgentPanel {
     pub fn clear_base_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
         self.retain_running_thread(old_view, cx);
-        self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
-        self.serialize(cx);
+        self.refresh_base_view_subscriptions(window, cx);
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         cx.notify();
     }
@@ -1784,42 +1783,12 @@ impl AgentPanel {
 
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Thread, cx);
 
-        // If the user is viewing a *parked* draft and the ephemeral
-        // new-draft slot is occupied, pressing `+` should just focus the
-        // ephemeral draft — not park it and create yet another empty one.
-        // This matches the mental model of `+` as "go to my new-thread
-        // slot". The parked draft will be put back into `retained_threads`
-        // by `set_base_view`'s `retain_running_thread` call.
-        if let Some(draft) = self.draft_thread.clone()
-            && self.active_thread_is_draft(cx)
-            && !self.active_view_is_new_draft(cx)
-            && *draft.read(cx).agent_key() == self.selected_agent
-        {
-            self.set_base_view(
-                BaseView::AgentThread {
-                    conversation_view: draft,
-                },
-                focus,
-                window,
-                cx,
-            );
-            return;
-        }
-
-        if let Some(draft) = self.draft_thread.clone() {
-            if self.draft_has_content(&draft, cx) {
-                let draft_id = draft.read(cx).thread_id;
-                self.draft_thread = None;
-                self._draft_editor_observation = None;
-                self.insert_retained_thread(draft_id, draft, cx);
-            } else if *draft.read(cx).agent_key() != self.selected_agent {
-                let old_draft_id = draft.read(cx).thread_id;
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    store.delete(old_draft_id, cx);
-                });
-                self.draft_thread = None;
-                self._draft_editor_observation = None;
-            }
+        // Every new thread is kept until the user removes it, so the current
+        // draft is parked even when it is empty.
+        if let Some(draft) = self.draft_thread.take() {
+            let draft_id = draft.read(cx).thread_id;
+            self._draft_editor_observation = None;
+            self.insert_retained_thread(draft_id, draft, cx);
         }
         self.activate_draft(focus, source, window, cx);
     }
@@ -2307,25 +2276,6 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, true, window, cx);
-    }
-
-    pub fn close_terminal_without_activating_draft(
-        &mut self,
-        terminal_id: TerminalId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_terminal_internal(terminal_id, false, window, cx);
-    }
-
-    fn close_terminal_internal(
-        &mut self,
-        terminal_id: TerminalId,
-        activate_draft_after_close: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         let was_active = self.active_terminal_id() == Some(terminal_id);
 
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2343,9 +2293,6 @@ impl AgentPanel {
         if was_active {
             self.base_view = BaseView::Uninitialized;
             self.refresh_base_view_subscriptions(window, cx);
-            if activate_draft_after_close {
-                self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
-            }
         }
 
         cx.emit(AgentPanelEvent::EntryChanged);
@@ -3035,20 +2982,21 @@ impl AgentPanel {
             if agent_matches
                 || has_editor_content
                 || draft.read(cx).has_pending_selections()
+                || draft.read(cx).has_saved_input()
                 || !draft_is_active
             {
                 return draft.clone();
             }
 
-            // Clean up the old empty draft's metadata so it doesn't
-            // linger as a ghost entry in the sidebar.
             let old_draft_id = draft.read(cx).thread_id;
-            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.delete(old_draft_id, cx);
-            });
-
             self.draft_thread = None;
             self._draft_editor_observation = None;
+            // The draft being replaced is empty, so it must not stay listed next to its
+            // replacement. Leaving it as the base view would retain it.
+            self.base_view = BaseView::Uninitialized;
+            if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                store.update(cx, |store, cx| store.delete(old_draft_id, cx));
+            }
         }
 
         let thread = self.create_agent_thread_with_server(
@@ -3204,8 +3152,7 @@ impl AgentPanel {
     }
 
     /// Moves a conversation view into the ephemeral `draft_thread` slot,
-    /// cleaning up any previous ephemeral draft and deleting the thread's
-    /// metadata so it no longer appears in the sidebar.
+    /// parking any previous ephemeral draft so it stays in the sidebar.
     fn set_ephemeral_draft(
         &mut self,
         conversation_view: Entity<ConversationView>,
@@ -3215,9 +3162,7 @@ impl AgentPanel {
             let old_id = old_draft.read(cx).thread_id;
             let new_id = conversation_view.read(cx).thread_id;
             if old_id != new_id {
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    store.delete(old_id, cx);
-                });
+                self.insert_retained_thread(old_id, old_draft, cx);
             }
             self._draft_editor_observation = None;
         }
@@ -12027,6 +11972,65 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_switching_agent_keeps_disconnected_draft_with_saved_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_draft_with_server(
+                Rc::new(StubAgentServer::new(
+                    StubAgentConnection::new().with_receipt_submissions(true),
+                )),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let draft = panel.read_with(&cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .expect("conversation")
+                .clone()
+        });
+        let message_editor = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("thread view")
+                .read(cx)
+                .message_editor
+                .clone()
+        });
+        message_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("unsent prompt", window, cx);
+        });
+        let thread = draft.read_with(&cx, |view, cx| view.root_thread(cx).expect("thread"));
+        thread.update(&mut cx, |thread, cx| {
+            thread.handle_connection_lost(cx);
+            cx.emit(acp_thread::AcpThreadEvent::LoadError(
+                acp_thread::LoadError::Other("connection lost".into()),
+            ));
+        });
+        cx.run_until_parked();
+        assert!(draft.read_with(&cx, |view, _| view.has_saved_input()));
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::NativeAgent;
+            panel.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        let thread_id = draft.read_with(&cx, |view, _| view.thread_id);
+        cx.update(|_, cx| {
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some()
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_disconnected_saved_input_is_not_evicted_as_idle(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let connection = StubAgentConnection::new()
@@ -13232,116 +13236,6 @@ mod tests {
             active_text, None,
             "fresh ephemeral draft should start empty, not carry the parked draft's prompt"
         );
-    }
-
-    /// When the user is viewing a *parked* draft (selected from the
-    /// sidebar) and presses `+`, the panel should just focus the
-    /// ephemeral new-draft slot — not park it and create yet another
-    /// empty draft. `+` is "go to my new-thread slot", not "reset state".
-    #[gpui::test]
-    async fn test_plus_with_parked_draft_active_focuses_ephemeral(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        cx.update(|cx| {
-            agent::ThreadStore::init_global(cx);
-            language_model::LanguageModelRegistry::test(cx);
-            <dyn fs::Fs>::set_global(fs.clone(), cx);
-        });
-
-        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
-        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        let multi_workspace =
-            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| {
-                multi_workspace.workspace().clone()
-            })
-            .unwrap();
-        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
-        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
-        let panel = workspace.update_in(cx, |workspace, window, cx| {
-            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
-            workspace.add_panel(panel.clone(), window, cx);
-            panel
-        });
-
-        // Open an initial draft, type into it, then press `+` to park it
-        // and create a fresh ephemeral. The fresh ephemeral is what we'll
-        // expect to refocus later.
-        panel.update_in(cx, |panel, window, cx| {
-            panel.selected_agent = Agent::Stub;
-            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
-        });
-        cx.run_until_parked();
-        let parked_thread_id = crate::test_support::active_thread_id(&panel, cx);
-        crate::test_support::type_draft_prompt(&panel, "parked draft prompt", cx);
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_thread(&NewThread, window, cx);
-        });
-        cx.run_until_parked();
-
-        let ephemeral_thread_id = crate::test_support::active_thread_id(&panel, cx);
-        let ephemeral_entity_id = panel.read_with(cx, |panel, _cx| {
-            panel.draft_thread.as_ref().unwrap().entity_id()
-        });
-        assert_ne!(
-            ephemeral_thread_id, parked_thread_id,
-            "sanity: parking should have produced a fresh ephemeral draft"
-        );
-
-        // Activate the parked draft (simulates clicking it in the sidebar).
-        panel.update_in(cx, |panel, window, cx| {
-            panel.load_agent_thread(
-                Agent::Stub,
-                parked_thread_id,
-                None,
-                None,
-                true,
-                AgentThreadSource::Sidebar,
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            crate::test_support::active_thread_id(&panel, cx),
-            parked_thread_id,
-            "sanity: parked draft should be the active view after load_agent_thread"
-        );
-        // The parked draft has content, so it was NOT reclaimed as
-        // ephemeral. The previous ephemeral draft should still be in
-        // the draft_thread slot.
-        panel.read_with(cx, |panel, _cx| {
-            assert_eq!(
-                panel.draft_thread.as_ref().unwrap().entity_id(),
-                ephemeral_entity_id,
-                "ephemeral draft slot should still hold the fresh draft"
-            );
-        });
-
-        // Now press `+`. The ephemeral draft should become the active
-        // view since it matches the selected agent.
-        panel.update_in(cx, |panel, window, cx| {
-            panel.new_thread(&NewThread, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, cx| {
-            assert_eq!(
-                panel.active_thread_id(cx),
-                Some(ephemeral_thread_id),
-                "`+` should have switched back to the existing ephemeral draft"
-            );
-            assert_eq!(
-                panel.draft_thread.as_ref().unwrap().entity_id(),
-                ephemeral_entity_id,
-                "`+` should not have replaced the ephemeral draft"
-            );
-            assert!(
-                panel.retained_threads.contains_key(&parked_thread_id),
-                "parked draft should remain in `retained_threads`"
-            );
-        });
     }
 
     /// When viewing a parked draft (agent A) and selecting a different
@@ -14749,6 +14643,18 @@ mod tests {
                 "empty destination draft should be rebound to the inherited agent"
             );
         });
+
+        cx.run_until_parked();
+        let listed_drafts = cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .filter(|thread| {
+                    thread.is_draft() && thread.references_folder_path(Path::new("/project_b"))
+                })
+                .count()
+        });
+        assert_eq!(listed_drafts, 1, "the replaced draft must not stay listed");
     }
 
     #[gpui::test]

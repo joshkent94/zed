@@ -506,7 +506,10 @@ pub struct ThreadMetadataStore {
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
-    conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    /// Whether the stored rows are in memory. Until then, a missing entry says
+    /// nothing about whether a thread is new.
+    is_loaded: bool,
+    conversation_subscriptions: HashMap<gpui::EntityId, (ThreadId, [Subscription; 2])>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
@@ -659,6 +662,7 @@ impl ThreadMetadataStore {
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
+        self.is_loaded = false;
 
         let list_task = cx
             .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
@@ -678,6 +682,7 @@ impl ThreadMetadataStore {
                     for row in rows {
                         this.cache_thread_metadata(row);
                     }
+                    this.is_loaded = true;
 
                     cx.notify();
                 })
@@ -1160,39 +1165,31 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
-    pub fn unarchived_draft_ids_matching(
-        &self,
-        matches: impl Fn(&ThreadMetadata) -> bool,
-    ) -> Vec<ThreadId> {
-        self.entries()
-            .filter(|thread| thread.is_draft() && !thread.archived && matches(thread))
-            .map(|thread| thread.thread_id)
-            .collect()
-    }
-
-    pub fn delete_all(
-        &mut self,
-        thread_ids: impl IntoIterator<Item = ThreadId>,
-        cx: &mut Context<Self>,
-    ) {
-        for thread_id in thread_ids {
-            self.delete(thread_id, cx);
-        }
-    }
-
     fn new(db: ThreadMetadataDb, cx: &mut Context<Self>) -> Self {
         let weak_store = cx.weak_entity();
 
-        cx.observe_new::<crate::ConversationView>(move |_view, _window, cx| {
+        cx.observe_new::<crate::ConversationView>(move |view, _window, cx| {
+            let placeholder = Self::placeholder_metadata(view, cx);
             let view_entity = cx.entity();
             let entity_id = view_entity.entity_id();
+            let thread_id = view.thread_id;
 
             cx.on_release({
                 let weak_store = weak_store.clone();
-                move |_view, cx| {
+                move |view, cx| {
+                    let thread_id = view.thread_id;
+                    let never_started = !view.has_connected();
                     weak_store
-                        .update(cx, |store, _cx| {
+                        .update(cx, |store, cx| {
                             store.conversation_subscriptions.remove(&entity_id);
+                            // Another view of the same draft may still be starting.
+                            let has_other_view = store
+                                .conversation_subscriptions
+                                .values()
+                                .any(|(other_thread_id, _)| *other_thread_id == thread_id);
+                            if never_started && !has_other_view {
+                                store.discard_empty_draft(thread_id, cx);
+                            }
                         })
                         .ok();
                 }
@@ -1201,9 +1198,18 @@ impl ThreadMetadataStore {
 
             weak_store
                 .update(cx, |this, cx| {
-                    let subscription = cx.subscribe(&view_entity, Self::handle_conversation_event);
+                    let subscriptions = [
+                        cx.subscribe(&view_entity, Self::handle_conversation_event),
+                        cx.subscribe(&view_entity, Self::handle_conversation_state_change),
+                    ];
                     this.conversation_subscriptions
-                        .insert(entity_id, subscription);
+                        .insert(entity_id, (thread_id, subscriptions));
+                    if let Some(placeholder) = placeholder
+                        && this.is_loaded
+                        && this.entry(placeholder.thread_id).is_none()
+                    {
+                        this.save(placeholder, cx);
+                    }
                 })
                 .ok();
         })
@@ -1240,6 +1246,7 @@ impl ThreadMetadataStore {
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
             reload_task: None,
+            is_loaded: false,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
@@ -1258,6 +1265,55 @@ impl ThreadMetadataStore {
             ops.insert(operation.id(), operation);
         }
         ops.into_values().collect()
+    }
+
+    /// The row a new thread gets before its session exists, so that it is listed
+    /// while the agent is still starting.
+    fn placeholder_metadata(view: &crate::ConversationView, cx: &App) -> Option<ThreadMetadata> {
+        let project = view.project().read(cx);
+        if view.root_session_id.is_some() || project.is_via_collab() {
+            return None;
+        }
+        let worktree_paths = project.worktree_paths(cx);
+        if worktree_paths.is_empty() {
+            return None;
+        }
+        let now = Utc::now();
+        Some(ThreadMetadata {
+            thread_id: view.thread_id,
+            session_id: None,
+            agent_id: view.agent_key().id(),
+            title: None,
+            title_override: None,
+            created_at: Some(now),
+            interacted_at: Some(now),
+            updated_at: now,
+            worktree_paths,
+            remote_connection: project.remote_connection_options(cx).cloned(),
+            archived: false,
+        })
+    }
+
+    fn handle_conversation_state_change(
+        &mut self,
+        conversation_view: Entity<crate::ConversationView>,
+        _event: &crate::conversation_view::StateChange,
+        cx: &mut Context<Self>,
+    ) {
+        let view = conversation_view.read(cx);
+        if view.failed_to_start() {
+            self.discard_empty_draft(view.thread_id, cx);
+        }
+    }
+
+    /// An empty draft whose session never started has nothing worth keeping.
+    fn discard_empty_draft(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if self.entry(thread_id).is_some_and(|thread| {
+            thread.is_draft() && thread.title.is_none() && thread.title_override.is_none()
+        }) && crate::draft_prompt_store::read(thread_id, cx).is_none()
+        {
+            self.delete(thread_id, cx);
+        }
     }
 
     fn handle_conversation_event(
@@ -1876,6 +1932,46 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
         }
+    }
+
+    #[gpui::test]
+    async fn test_discard_empty_draft_keeps_drafts_with_content(cx: &mut TestAppContext) {
+        init_test(cx);
+        let draft = |title: &str| ThreadMetadata {
+            session_id: None,
+            ..make_metadata("unused", title, Utc::now(), PathList::default())
+        };
+        let empty = draft("");
+        let titled = draft("Titled");
+        let with_prompt = draft("");
+        let ids = [empty.thread_id, titled.thread_id, with_prompt.thread_id];
+        cx.update(|cx| {
+            crate::draft_prompt_store::write(
+                with_prompt.thread_id,
+                &[acp::ContentBlock::Text(acp::TextContent::new("unsent"))],
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                for draft in [empty, titled, with_prompt] {
+                    store.save(draft, cx);
+                }
+                for id in ids {
+                    store.discard_empty_draft(id, cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        let is_listed = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            ids.map(|id| store.entry(id).is_some())
+        });
+        assert_eq!(is_listed, [false, true, true]);
     }
 
     fn init_test(cx: &mut TestAppContext) {
