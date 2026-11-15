@@ -13,6 +13,7 @@ use util::path;
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
+        cx.set_global(db::AppDatabase::test_new());
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -126,18 +127,13 @@ async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppC
     let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
     let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
 
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
-
-    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.test_add_workspace(project_b, window, cx);
-    });
-    cx.run_until_parked();
-
-    multi_workspace.read_with(cx, |multi_workspace, cx| {
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_a, project_b], cx);
+    let initial_keys = multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(multi_workspace.multi_workspace_enabled(cx));
         assert_eq!(multi_workspace.workspaces().count(), 2);
+        multi_workspace.project_group_keys(cx)
     });
+    assert_eq!(initial_keys.len(), 2);
 
     cx.update(|_window, cx| {
         let mut settings = AgentSettings::get_global(cx).clone();
@@ -150,8 +146,218 @@ async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppC
         assert!(!multi_workspace.multi_workspace_enabled(cx));
         assert!(!multi_workspace.sidebar_open());
         assert_eq!(multi_workspace.workspaces().count(), 1);
-        assert!(multi_workspace.project_group_keys().is_empty());
+        assert!(multi_workspace.project_group_keys(cx).is_empty());
+        assert!(multi_workspace.project_groups(cx).is_empty());
     });
+
+    cx.update(|_window, cx| {
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.enabled = true;
+        AgentSettings::override_global(settings, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.project_group_keys(cx), initial_keys);
+        let restored_keys: Vec<_> = multi_workspace
+            .project_groups(cx)
+            .into_iter()
+            .map(|group| group.key)
+            .collect();
+        assert_eq!(restored_keys, initial_keys);
+    });
+}
+
+#[gpui::test]
+async fn test_shared_sidebar_survives_new_windows_and_sessions(
+    cx: &mut TestAppContext,
+    restarted: &mut TestAppContext,
+) {
+    use crate::persistence::{model::SerializedProjectGroup, write_multi_workspace_state};
+    init_test(cx);
+    let key_a = ProjectGroupKey::new(None, PathList::new(&[path!("/a")]));
+    let key_b = ProjectGroupKey::new(None, PathList::new(&[path!("/b")]));
+    let linked_key = ProjectGroupKey::new(None, PathList::new(&[path!("/linked")]));
+    let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    // The newer window has the default label; the older one has the user's rename.
+    for (id, groups) in [
+        (
+            70,
+            vec![
+                SerializedProjectGroup::from_group(&linked_key, true, Some("Original".into())),
+                SerializedProjectGroup::from_group(&key_b, true, None),
+                SerializedProjectGroup::from_group(&key_a, true, Some("Older".into())),
+            ],
+        ),
+        (
+            71,
+            vec![SerializedProjectGroup::from_group(&linked_key, false, None)],
+        ),
+    ] {
+        write_multi_workspace_state(
+            &kvp,
+            WindowId::from(id as u64),
+            MultiWorkspaceState {
+                project_groups: groups,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    let legacy_groups = cx.update(|cx| crate::persistence::read_shared_project_groups(cx).unwrap());
+    assert_eq!(legacy_groups.len(), 3);
+    kvp.write_kvp(
+        crate::persistence::SHARED_PROJECT_GROUPS_KEY.into(),
+        "invalid JSON".into(),
+    )
+    .await
+    .unwrap();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/a",
+        json!({".git": {
+            "HEAD": "ref: refs/heads/main",
+            "worktrees": {"linked": {"commondir": "../..", "HEAD": "ref: refs/heads/linked"}}
+        }}),
+    )
+    .await;
+    fs.insert_tree(
+        "/linked",
+        json!({".git": "gitdir: /a/.git/worktrees/linked"}),
+    )
+    .await;
+    let first = Project::test(fs.clone(), [], cx).await;
+    let second = Project::test(fs, [], cx).await;
+    let first = cx.add_window(|window, cx| MultiWorkspace::test_new(first, window, cx));
+    let second = cx.add_window(|window, cx| MultiWorkspace::test_new(second, window, cx));
+    cx.run_until_parked();
+    first
+        .update(cx, |multi_workspace, _, cx| {
+            assert_eq!(
+                multi_workspace.project_group_keys(cx),
+                [key_a.clone(), key_b.clone()]
+            );
+            let group = multi_workspace.group_state_by_key_mut(&key_a, cx).unwrap();
+            assert_eq!(group.custom_name.as_deref(), Some("Original"));
+            assert!(!group.expanded);
+            group.custom_name = Some("Renamed".into());
+            group.expanded = true;
+        })
+        .unwrap();
+    second
+        .update(cx, |multi_workspace, window, cx| {
+            let group = multi_workspace.group_state_by_key(&key_a, cx).unwrap();
+            assert!(group.expanded);
+            assert_eq!(group.custom_name.as_deref(), Some("Renamed"));
+            multi_workspace.remove_project_group(&key_b, window, cx)
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .read_with(cx, |multi_workspace, cx| multi_workspace
+                .project_group_keys(cx))
+            .unwrap(),
+        std::slice::from_ref(&key_a)
+    );
+    first
+        .update(cx, |multi_workspace, _, cx| {
+            multi_workspace.flush_serialization(cx)
+        })
+        .unwrap()
+        .await;
+
+    init_test(restarted);
+    let database = cx.update(|cx| db::AppDatabase::global(cx).clone());
+    restarted.update(|cx| cx.set_global(db::AppDatabase(database)));
+    let fs = FakeFs::new(restarted.executor());
+    let project = Project::test(fs, [], restarted).await;
+    let window = restarted.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    window
+        .read_with(restarted, |multi_workspace, cx| {
+            assert_eq!(
+                multi_workspace.project_group_keys(cx),
+                std::slice::from_ref(&key_a)
+            );
+            let group = multi_workspace.group_state_by_key(&key_a, cx).unwrap();
+            assert_eq!(group.custom_name.as_deref(), Some("Renamed"));
+            assert!(group.expanded);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_shared_sidebar_recovers_after_database_read_error(cx: &mut TestAppContext) {
+    use crate::persistence::{SHARED_PROJECT_GROUPS_KEY, model::SerializedProjectGroup};
+
+    init_test(cx);
+    let database = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    let saved_key = ProjectGroupKey::new(None, PathList::new(&[path!("/saved")]));
+    let removed_key = ProjectGroupKey::new(None, PathList::new(&[path!("/removed")]));
+    let saved = serde_json::to_string(&[
+        SerializedProjectGroup::from_group(&removed_key, true, None),
+        SerializedProjectGroup::from_group(&saved_key, false, Some("Saved".into())),
+    ])
+    .unwrap();
+    database
+        .write_kvp(SHARED_PROJECT_GROUPS_KEY.into(), saved.clone())
+        .await
+        .unwrap();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/opened", json!({})).await;
+    fs.insert_tree("/removed", json!({})).await;
+    let opened = Project::test(fs.clone(), [path!("/opened").as_ref()], cx).await;
+    let removed = Project::test(fs, [path!("/removed").as_ref()], cx).await;
+    let opened_key = opened.read_with(cx, |project, cx| project.project_group_key(cx));
+    database
+        .write(|connection| {
+            connection.exec("ALTER TABLE kv_store RENAME TO unavailable_kv_store")?()
+        })
+        .await
+        .unwrap();
+    let (multi_workspace, cx) = setup_multi_workspace(&[opened, removed], cx);
+    multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove_project_group(&removed_key, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| multi_workspace
+            .project_group_keys(cx)),
+        std::slice::from_ref(&opened_key)
+    );
+
+    database
+        .write(|connection| {
+            connection.exec("ALTER TABLE unavailable_kv_store RENAME TO kv_store")?()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        database.read_kvp(SHARED_PROJECT_GROUPS_KEY).unwrap(),
+        Some(saved)
+    );
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace
+            .group_state_by_key_mut(&opened_key, cx)
+            .unwrap()
+            .custom_name = Some("Opened".into());
+    });
+    cx.run_until_parked();
+    let groups = cx.update(|_, cx| crate::persistence::read_shared_project_groups(cx).unwrap());
+    assert_eq!(
+        groups.iter().map(|group| &group.key).collect::<Vec<_>>(),
+        [&opened_key, &saved_key]
+    );
+    assert_eq!(groups[0].custom_name.as_deref(), Some("Opened"));
+    assert_eq!(groups[1].custom_name.as_deref(), Some("Saved"));
+    assert!(!groups[1].expanded);
 }
 
 #[gpui::test]
@@ -170,8 +376,8 @@ async fn test_project_group_keys_initial(cx: &mut TestAppContext) {
         mw.open_sidebar(cx);
     });
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys: Vec<ProjectGroupKey> = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys: Vec<ProjectGroupKey> = multi_workspace.project_group_keys(cx);
         assert_eq!(keys.len(), 1, "should have exactly one key on creation");
         assert_eq!(keys[0], expected_key);
     });
@@ -200,8 +406,8 @@ async fn test_project_group_keys_add_workspace(cx: &mut TestAppContext) {
         mw.open_sidebar(cx);
     });
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        assert_eq!(mw.project_group_keys().len(), 1);
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.project_group_keys(cx).len(), 1);
     });
 
     // Adding a workspace with a different project root adds a new key.
@@ -209,8 +415,8 @@ async fn test_project_group_keys_add_workspace(cx: &mut TestAppContext) {
         mw.test_add_workspace(project_b, window, cx);
     });
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys: Vec<ProjectGroupKey> = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys: Vec<ProjectGroupKey> = multi_workspace.project_group_keys(cx);
         assert_eq!(
             keys.len(),
             2,
@@ -240,32 +446,32 @@ async fn test_move_active_project_group_actions(cx: &mut TestAppContext) {
     });
 
     assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| {
-            multi_workspace.project_group_keys()
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.project_group_keys(cx)
         }),
         vec![key_b.clone(), key_a.clone()]
     );
 
     cx.dispatch_action(MoveProjectDown);
     assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| {
-            multi_workspace.project_group_keys()
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.project_group_keys(cx)
         }),
         vec![key_a.clone(), key_b.clone()]
     );
 
     cx.dispatch_action(MoveProjectDown);
     assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| {
-            multi_workspace.project_group_keys()
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.project_group_keys(cx)
         }),
         vec![key_a.clone(), key_b.clone()]
     );
 
     cx.dispatch_action(MoveProjectUp);
     assert_eq!(
-        multi_workspace.read_with(cx, |multi_workspace, _| {
-            multi_workspace.project_group_keys()
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.project_group_keys(cx)
         }),
         vec![key_b, key_a]
     );
@@ -596,8 +802,8 @@ async fn test_project_group_keys_duplicate_not_added(cx: &mut TestAppContext) {
         mw.test_add_workspace(project_a2, window, cx);
     });
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys: Vec<ProjectGroupKey> = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys: Vec<ProjectGroupKey> = multi_workspace.project_group_keys(cx);
         assert_eq!(
             keys.len(),
             1,
@@ -625,8 +831,8 @@ async fn test_adding_worktree_updates_project_group_key(cx: &mut TestAppContext)
     });
     cx.run_until_parked();
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys = multi_workspace.project_group_keys(cx);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], initial_key);
     });
@@ -647,8 +853,8 @@ async fn test_adding_worktree_updates_project_group_key(cx: &mut TestAppContext)
         "adding a worktree should change the project group key"
     );
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys = multi_workspace.project_group_keys(cx);
         assert!(
             keys.contains(&updated_key),
             "should contain the updated key; got {keys:?}"
@@ -965,15 +1171,18 @@ async fn test_close_workspace_prefers_already_loaded_neighboring_workspace(
 
     multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.activate(workspace_a.clone(), None, window, cx);
-        multi_workspace.test_add_project_group(ProjectGroup {
-            key: project_c_key.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: project_c_key.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
-    multi_workspace.read_with(cx, |multi_workspace, _cx| {
-        let keys = multi_workspace.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys = multi_workspace.project_group_keys(cx);
         assert_eq!(
             keys.len(),
             3,
@@ -1095,7 +1304,7 @@ async fn test_close_workspace_prefers_workspace_in_same_project_group(cx: &mut T
             vec![workspace_a_2],
             "only the fallback workspace should remain in project group A"
         );
-        assert_eq!(multi_workspace.project_group_keys(), vec![key_b, key_a]);
+        assert_eq!(multi_workspace.project_group_keys(cx), vec![key_b, key_a]);
     });
 }
 
@@ -1115,12 +1324,15 @@ async fn test_close_workspace_opens_unloaded_local_neighbor(cx: &mut TestAppCont
         multi_workspace.workspace().clone()
     });
 
-    multi_workspace.update(cx, |multi_workspace, _cx| {
-        multi_workspace.test_add_project_group(ProjectGroup {
-            key: key_b.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: key_b.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
     let closed = multi_workspace
@@ -1156,12 +1368,15 @@ async fn test_remove_unloaded_project_group_removes_its_row(cx: &mut TestAppCont
     let key_b = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/project-b")]));
     let (multi_workspace, cx) = setup_multi_workspace(&[project_a], cx);
 
-    multi_workspace.update(cx, |multi_workspace, _cx| {
-        multi_workspace.test_add_project_group(ProjectGroup {
-            key: key_b.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: key_b.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
     let removed = multi_workspace
@@ -1172,9 +1387,80 @@ async fn test_remove_unloaded_project_group_removes_its_row(cx: &mut TestAppCont
         .expect("removing an unloaded project group should succeed");
 
     assert!(removed, "the unloaded project group row should be removed");
-    multi_workspace.read_with(cx, |multi_workspace, _cx| {
-        assert_eq!(multi_workspace.project_group_keys(), vec![key_a]);
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.project_group_keys(cx), vec![key_a]);
     });
+}
+
+#[gpui::test]
+async fn test_remove_project_group_keeps_other_windows_open_project(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", json!({})).await;
+    let first = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let second = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let group_key = first.read_with(cx, |project, cx| project.project_group_key(cx));
+    let first = cx.add_window(|window, cx| MultiWorkspace::test_new(first, window, cx));
+    let second = cx.add_window(|window, cx| MultiWorkspace::test_new(second, window, cx));
+    for window in [first, second] {
+        window
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.open_sidebar(cx)
+            })
+            .unwrap();
+    }
+    cx.run_until_parked();
+
+    let close = |window: gpui::WindowHandle<MultiWorkspace>, cx: &mut TestAppContext| {
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.remove_project_group(&group_key, window, cx)
+            })
+            .unwrap()
+    };
+    assert!(close(first, cx).await.unwrap());
+    first
+        .read_with(cx, |multi_workspace, cx| {
+            assert!(
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .root_paths(cx)
+                    .is_empty()
+            );
+            assert_eq!(
+                multi_workspace
+                    .workspaces_for_project_group(&group_key, cx)
+                    .count(),
+                0
+            );
+        })
+        .unwrap();
+    second
+        .read_with(cx, |multi_workspace, cx| {
+            assert_eq!(
+                multi_workspace.workspace().read(cx).project_group_key(cx),
+                group_key
+            );
+            assert!(multi_workspace.project_group_keys(cx).contains(&group_key));
+        })
+        .unwrap();
+    let can_remove = |cx: &mut TestAppContext| {
+        first
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.can_remove_project_group(&group_key, cx)
+            })
+            .unwrap()
+    };
+    assert!(!can_remove(cx));
+    assert!(!close(first, cx).await.unwrap());
+    assert!(close(second, cx).await.unwrap());
+    assert!(can_remove(cx));
+    first
+        .read_with(cx, |multi_workspace, cx| {
+            assert!(multi_workspace.project_group_keys(cx).is_empty());
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -1191,12 +1477,15 @@ async fn test_remove_project_group_opens_unloaded_local_neighbor(cx: &mut TestAp
     let key_b = project_b.read_with(cx, |project, cx| project.project_group_key(cx));
     let (multi_workspace, cx) = setup_multi_workspace(&[project_a], cx);
 
-    multi_workspace.update(cx, |multi_workspace, _cx| {
-        multi_workspace.test_add_project_group(ProjectGroup {
-            key: key_b.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: key_b.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
     let removed = multi_workspace
@@ -1246,10 +1535,12 @@ async fn test_remove_project_group_replaces_unretained_active_workspace(cx: &mut
                 SerializedProjectGroupState {
                     key: key_a.clone(),
                     expanded: true,
+                    custom_name: None,
                 },
                 SerializedProjectGroupState {
                     key: remote_key.clone(),
                     expanded: true,
+                    custom_name: None,
                 },
             ],
             cx,
@@ -1260,7 +1551,7 @@ async fn test_remove_project_group_replaces_unretained_active_workspace(cx: &mut
             "the active workspace should remain provisional"
         );
         assert_eq!(
-            multi_workspace.project_group_keys(),
+            multi_workspace.project_group_keys(cx),
             vec![key_a.clone(), remote_key.clone()],
             "the remote project group should immediately follow the active local group"
         );
@@ -1288,7 +1579,7 @@ async fn test_remove_project_group_replaces_unretained_active_workspace(cx: &mut
             "an unloaded remote neighbor should fall back to an empty workspace"
         );
         assert_eq!(
-            multi_workspace.project_group_keys(),
+            multi_workspace.project_group_keys(cx),
             vec![remote_key],
             "only the remote project group should remain"
         );
@@ -1380,8 +1671,8 @@ async fn test_remote_project_root_dir_changes_update_groups(cx: &mut TestAppCont
     });
 
     let initial_key = project_b.read_with(cx, |p, cx| p.project_group_key(cx));
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys = multi_workspace.project_group_keys(cx);
         assert!(
             keys.contains(&initial_key),
             "project groups should contain the initial key for the registered workspace"
@@ -1437,8 +1728,8 @@ async fn test_remote_project_root_dir_changes_update_groups(cx: &mut TestAppCont
         "remote worktree update should change the project group key"
     );
 
-    multi_workspace.read_with(cx, |mw, _cx| {
-        let keys = mw.project_group_keys();
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let keys = multi_workspace.project_group_keys(cx);
         assert!(
             keys.contains(&updated_key),
             "project groups should contain the updated key after remote change; got {keys:?}"
@@ -1447,6 +1738,135 @@ async fn test_remote_project_root_dir_changes_update_groups(cx: &mut TestAppCont
             !keys.contains(&initial_key),
             "project groups should no longer contain the stale initial key; got {keys:?}"
         );
+    });
+}
+
+#[gpui::test]
+async fn test_folderless_thread_host_opens_visible_folders_separately(cx: &mut TestAppContext) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/files"), json!({ "note.txt": "", "folder": {} }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let _thread_host = project.read_with(cx, |project, cx| {
+        project.retain_folderless_thread_host(cx).unwrap()
+    });
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    let host =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    for path in [path!("/files/note.txt"), path!("/files/folder")] {
+        host.update_in(cx, |host, window, cx| {
+            host.open_paths(
+                vec![path.into()],
+                OpenOptions {
+                    visible: Some(OpenVisible::OnlyDirectories),
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(host.read_with(cx, |host, cx| host.root_paths(cx).is_empty()));
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            if path == path!("/files/note.txt") {
+                assert_eq!(multi_workspace.workspace(), &host);
+            } else {
+                assert_eq!(
+                    PathList::new(&multi_workspace.workspace().read(cx).root_paths(cx)),
+                    PathList::new(&[path])
+                );
+                assert!(multi_workspace.is_workspace_retained(&host));
+            }
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_folderless_thread_host_with_visible_worktree_opens_folders_in_place(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/a"), json!({})).await;
+    fs.insert_tree(path!("/b"), json!({})).await;
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let _thread_host = project.read_with(cx, |project, cx| {
+        project.retain_folderless_thread_host(cx).unwrap()
+    });
+    let (multi_workspace, cx) = setup_multi_workspace(std::slice::from_ref(&project), cx);
+    let host =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/a"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    host.update_in(cx, |host, window, cx| {
+        host.open_paths(
+            vec![path!("/b").into()],
+            OpenOptions {
+                visible: Some(OpenVisible::All),
+                ..Default::default()
+            },
+            None,
+            window,
+            cx,
+        )
+    })
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        PathList::new(&host.read_with(cx, |host, cx| host.root_paths(cx))),
+        PathList::new(&[path!("/a"), path!("/b")])
+    );
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &host);
+    });
+}
+
+#[gpui::test]
+async fn test_restored_sidebar_keeps_active_workspace_project_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/a", json!({})).await;
+    fs.insert_tree("/b", json!({})).await;
+    let project = Project::test(fs, ["/a".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let active_key = |cx: &mut VisualTestContext| {
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).project_group_key(cx)
+        })
+    };
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_open_sidebar(cx)
+    });
+    cx.run_until_parked();
+    let key = active_key(cx);
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.project_group_keys(cx).contains(&key));
+    });
+
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/b", true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let key = active_key(cx);
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.project_group_keys(cx).contains(&key));
     });
 }
 
@@ -1501,10 +1921,10 @@ async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mu
     cx.run_until_parked();
     assert_eq!(open_task.await.unwrap(), empty_workspace);
     window
-        .read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().count(), 1);
-            assert_eq!(mw.workspace(), &empty_workspace);
-            assert_eq!(mw.project_group_keys(), vec![]);
+        .read_with(cx, |multi_workspace, cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 1);
+            assert_eq!(multi_workspace.workspace(), &empty_workspace);
+            assert_eq!(multi_workspace.project_group_keys(cx), vec![]);
         })
         .unwrap();
 
@@ -1530,11 +1950,11 @@ async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mu
     assert_ne!(workspace_a, empty_workspace);
 
     window
-        .read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().count(), 1);
-            assert_eq!(mw.workspace(), &workspace_a);
+        .read_with(cx, |multi_workspace, cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 1);
+            assert_eq!(multi_workspace.workspace(), &workspace_a);
             assert_eq!(
-                mw.project_group_keys(),
+                multi_workspace.project_group_keys(cx),
                 vec![ProjectGroupKey::new(
                     None,
                     PathList::new(&[path!("/project_a")])
@@ -1570,11 +1990,11 @@ async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mu
     assert!(!cx.has_pending_prompt());
     assert_ne!(workspace_b, workspace_a);
     window
-        .read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().count(), 2);
-            assert_eq!(mw.workspace(), &workspace_b);
+        .read_with(cx, |multi_workspace, cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 2);
+            assert_eq!(multi_workspace.workspace(), &workspace_b);
             assert_eq!(
-                mw.project_group_keys(),
+                multi_workspace.project_group_keys(cx),
                 vec![
                     ProjectGroupKey::new(None, PathList::new(&[path!("/project_b")])),
                     ProjectGroupKey::new(None, PathList::new(&[path!("/project_a")]))
@@ -1612,12 +2032,15 @@ async fn test_close_workspace_with_remote_neighbor_does_not_create_local_workspa
         )),
         PathList::new(&[PathBuf::from("/remote/project")]),
     );
-    multi_workspace.update(cx, |mw, _cx| {
-        mw.test_add_project_group(ProjectGroup {
-            key: remote_key.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: remote_key.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
     let workspace_a = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
@@ -1683,12 +2106,15 @@ async fn test_remove_project_group_with_remote_neighbor_does_not_create_local_wo
         )),
         PathList::new(&[PathBuf::from("/remote/project")]),
     );
-    multi_workspace.update(cx, |mw, _cx| {
-        mw.test_add_project_group(ProjectGroup {
-            key: remote_key.clone(),
-            workspaces: Vec::new(),
-            expanded: true,
-        });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(
+            ProjectGroup {
+                key: remote_key.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            },
+            cx,
+        );
     });
 
     // Remove the local group A. The neighbor is the remote group with no
@@ -1744,7 +2170,7 @@ async fn test_nearest_retained_workspace(cx: &mut TestAppContext) {
 
     multi_workspace.update(cx, |multi_workspace, cx| {
         assert_eq!(
-            multi_workspace.project_group_keys(),
+            multi_workspace.project_group_keys(cx),
             vec![key_d.clone(), key_c.clone(), key_b.clone(), key_a.clone()],
             "new project groups should be inserted before existing groups"
         );

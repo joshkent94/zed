@@ -25,7 +25,6 @@ pub(crate) struct ThreadSwitcherThreadEntry {
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
     pub diff_stats: DiffStats,
-    pub is_draft: bool,
     pub is_title_generating: bool,
     pub notified: bool,
     pub timestamp: SharedString,
@@ -95,7 +94,6 @@ impl ThreadSwitcherEntry {
 
     fn icon(&self) -> IconName {
         match self {
-            Self::Thread(entry) if entry.is_draft => IconName::Circle,
             Self::Thread(entry) => entry.icon,
             Self::Terminal(_) => IconName::Terminal,
         }
@@ -103,7 +101,6 @@ impl ThreadSwitcherEntry {
 
     fn icon_from_external_svg(&self) -> Option<SharedString> {
         match self {
-            Self::Thread(entry) if entry.is_draft => None,
             Self::Thread(entry) => entry.icon_from_external_svg.clone(),
             Self::Terminal(_) => None,
         }
@@ -134,13 +131,6 @@ impl ThreadSwitcherEntry {
         match self {
             Self::Thread(entry) => entry.timestamp.clone(),
             Self::Terminal(entry) => entry.timestamp.clone(),
-        }
-    }
-
-    fn is_draft(&self) -> bool {
-        match self {
-            Self::Thread(entry) => entry.is_draft,
-            Self::Terminal(_) => false,
         }
     }
 
@@ -414,11 +404,6 @@ impl Render for ThreadSwitcher {
                         ThreadItem::new(entry.element_id(), entry.title())
                             .rounded(true)
                             .icon(entry.icon())
-                            .when(entry.is_draft(), |this| {
-                                this.icon_color(Color::Custom(
-                                    cx.theme().colors().icon_muted.opacity(0.2),
-                                ))
-                            })
                             .status(entry.status())
                             .when_some(entry.icon_from_external_svg(), |this, svg| {
                                 this.custom_icon_from_external_svg(svg)
@@ -435,7 +420,6 @@ impl Render for ThreadSwitcher {
                                 this.removed(diff_stats.lines_removed as usize)
                             })
                             .selected(ix == selected_index)
-                            .base_bg(cx.theme().colors().elevated_surface_background)
                             .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
                                 if *hovered {
                                     this.select_index(ix, cx);

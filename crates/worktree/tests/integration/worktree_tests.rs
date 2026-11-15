@@ -5402,6 +5402,7 @@ async fn test_root_repo_common_dir(executor: BackgroundExecutor, cx: &mut TestAp
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -5549,6 +5550,7 @@ async fn test_linked_worktree_gitfile_event_preserves_repo(
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -5621,6 +5623,7 @@ async fn test_shared_common_dir_event_updates_all_repositories(
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -5702,6 +5705,7 @@ async fn test_noisy_dot_git_events_do_not_emit_git_repo_update(
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -5962,6 +5966,7 @@ async fn test_linked_worktree_event_in_unregistered_common_git_dir_does_not_pani
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;

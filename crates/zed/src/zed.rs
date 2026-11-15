@@ -194,6 +194,36 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
+    cx.on_action(|_: &agent_ui::NewThreadWithPrompt, cx| {
+        let origin = cx.active_window();
+        cx.defer(move |cx| {
+            let owner = origin
+                .and_then(|window| window.downcast::<MultiWorkspace>())
+                .or_else(|| {
+                    origin?
+                        .downcast::<settings_ui::SettingsWindow>()?
+                        .read(cx)
+                        .ok()?
+                        .original_window()
+                        .filter(|window| window.read(cx).is_ok())
+                })
+                .or_else(|| Sidebar::most_recent_workspace_window(cx));
+            let app_state = AppState::global(cx);
+            cx.spawn(async move |cx| {
+                let owner = match owner {
+                    Some(owner) => owner,
+                    None => {
+                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?
+                    }
+                };
+                gpui::AnyWindowHandle::from(owner).update(cx, |_, window, cx| {
+                    sidebar::open_new_thread_modal(origin == Some(owner.into()), window, cx);
+                    window.activate_window();
+                })
+            })
+            .detach_and_log_err(cx);
+        });
+    });
 
     cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
 
@@ -7879,30 +7909,19 @@ mod tests {
             )
         };
 
-        // Window A (dir1+dir2): 1 workspace restored, but 2 project group keys.
-        restored_a
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![
-                        ProjectGroupKey::new(None, PathList::new(&[dir2])),
-                        ProjectGroupKey::new(None, PathList::new(&[dir1])),
-                    ]
-                );
-                assert_eq!(mw.workspaces().count(), 1);
-            })
-            .unwrap();
-
-        // Window B (dir3): 1 workspace, 1 project group key.
-        restored_b
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![ProjectGroupKey::new(None, PathList::new(&[dir3]))]
-                );
-                assert_eq!(mw.workspaces().count(), 1);
-            })
-            .unwrap();
+        let expected_groups = vec![
+            ProjectGroupKey::new(None, PathList::new(&[dir3])),
+            ProjectGroupKey::new(None, PathList::new(&[dir2])),
+            ProjectGroupKey::new(None, PathList::new(&[dir1])),
+        ];
+        for window in [restored_a, restored_b] {
+            window
+                .read_with(cx, |multi_workspace, cx| {
+                    assert_eq!(multi_workspace.project_group_keys(cx), expected_groups);
+                    assert_eq!(multi_workspace.workspaces().count(), 1);
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]
@@ -8290,8 +8309,8 @@ mod tests {
 
         // Verify the restored window has all 3 project groups.
         restored
-            .read_with(cx, |mw, _cx| {
-                let keys = mw.project_group_keys();
+            .read_with(cx, |multi_workspace, cx| {
+                let keys = multi_workspace.project_group_keys(cx);
                 assert_eq!(
                     keys.len(),
                     3,
@@ -8317,8 +8336,8 @@ mod tests {
         cx.run_until_parked();
 
         restored
-            .read_with(cx, |mw, _cx| {
-                let keys = mw.project_group_keys();
+            .read_with(cx, |multi_workspace, cx| {
+                let keys = multi_workspace.project_group_keys(cx);
                 assert!(
                     keys.contains(&key_b),
                     "restored group key_b should survive a workspace key change; got {keys:?}"
@@ -8363,7 +8382,9 @@ mod tests {
 
         let project_key = ProjectGroupKey::new(None, PathList::new(&[path!("/my-project")]));
         let keys = window
-            .read_with(cx, |mw, _| mw.project_group_keys())
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.project_group_keys(cx)
+            })
             .unwrap();
         assert_eq!(
             keys,
@@ -8374,7 +8395,9 @@ mod tests {
         cx.dispatch_action(window.into(), CloseProject);
 
         let keys = window
-            .read_with(cx, |mw, _| mw.project_group_keys())
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.project_group_keys(cx)
+            })
             .unwrap();
         assert!(
             keys.is_empty(),
@@ -8435,8 +8458,8 @@ mod tests {
         cx.background_executor.run_until_parked();
 
         let keys_before = window
-            .read_with(cx, |multi_workspace, _| {
-                multi_workspace.project_group_keys()
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.project_group_keys(cx)
             })
             .unwrap();
         assert_eq!(
@@ -8449,8 +8472,8 @@ mod tests {
         cx.background_executor.run_until_parked();
 
         let keys_after = window
-            .read_with(cx, |multi_workspace, _| {
-                multi_workspace.project_group_keys()
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.project_group_keys(cx)
             })
             .unwrap();
         assert_eq!(
@@ -9503,7 +9526,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_startup_folder_request_takes_its_project_out_of_a_restored_sidebar(
+    async fn test_startup_folder_request_keeps_the_shared_sidebar_in_both_windows(
         cx: &mut TestAppContext,
     ) {
         use util::path_list::PathList;
@@ -9559,8 +9582,8 @@ mod tests {
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
                 .map(|window| {
                     window
-                        .read_with(cx, |multi_workspace, _| {
-                            multi_workspace.project_group_keys()
+                        .read_with(cx, |multi_workspace, cx| {
+                            multi_workspace.project_group_keys(cx)
                         })
                         .unwrap()
                 })
@@ -9581,11 +9604,9 @@ mod tests {
                 (vec![PathBuf::from(path!("/project"))], Vec::new()),
             ]
         );
-        let restored_sidebar = sidebar_projects(cx)
-            .into_iter()
-            .find(|projects| projects.contains(&project_key))
-            .unwrap();
-        assert_eq!(restored_sidebar, vec![project_key]);
+        for projects in sidebar_projects(cx) {
+            assert_eq!(projects, vec![other_key.clone(), project_key.clone()]);
+        }
     }
 
     #[gpui::test]
@@ -9860,6 +9881,7 @@ mod tests {
                 sha: "aaa".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;

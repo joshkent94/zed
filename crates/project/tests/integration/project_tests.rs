@@ -20247,6 +20247,7 @@ async fn test_project_group_key_groups_nested_linked_worktree_under_main_repo(
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;

@@ -664,6 +664,7 @@ message Worktree {
   string sha = 3;
   bool is_main = 4;
   bool is_bare = 5;
+  bool is_prunable = 6;
 }
 
 message GitCreateWorktree {

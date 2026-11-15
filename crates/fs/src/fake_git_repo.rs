@@ -758,6 +758,7 @@ impl GitRepository for FakeGitRepository {
                     sha: head_sha.into(),
                     is_main: true,
                     is_bare: false,
+                    is_prunable: false,
                 });
                 (main_worktree, state.refs.clone())
             })?;
@@ -791,12 +792,14 @@ impl GitRepository for FakeGitRepository {
                         .map(PathBuf::from)
                         .unwrap_or_default();
 
+                    let is_prunable = !fs.is_dir(&worktree_path).await;
                     all.push(Worktree {
                         path: worktree_path,
                         ref_name: ref_name.map(Into::into),
                         sha: sha.into(),
                         is_main: false,
                         is_bare: false,
+                        is_prunable,
                     });
                 }
             }

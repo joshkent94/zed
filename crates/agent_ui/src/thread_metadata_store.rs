@@ -222,11 +222,13 @@ pub(crate) fn worktree_paths_from_columns(
             })
             .unwrap_or_default()
     };
+    let folders = path_list(folder_paths, folder_paths_order);
+    // Older rows predate the main-worktree columns but still belong to their folders.
     WorktreePaths::from_path_lists(
         path_list(main_worktree_paths, main_worktree_paths_order),
-        path_list(folder_paths, folder_paths_order),
+        folders.clone(),
     )
-    .unwrap_or_else(|_| WorktreePaths::default())
+    .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&folders))
     .with_serialized_delta_clones(delta_clones.as_deref())
 }
 
@@ -387,6 +389,10 @@ impl ThreadMetadata {
     }
     pub fn main_worktree_paths(&self) -> &PathList {
         self.worktree_paths.main_worktree_path_list()
+    }
+
+    pub fn is_projectless(&self) -> bool {
+        self.folder_paths().is_empty() && self.remote_connection.is_none()
     }
 
     pub fn references_folder_path(&self, path: &Path) -> bool {
@@ -550,11 +556,21 @@ pub struct ThreadMetadataStore {
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
+    reload_generation: usize,
     is_loaded: bool,
-    conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
-    pending_thread_ops_tx: async_channel::Sender<DbOperation>,
+    /// Foreground changes made after the current database snapshot was requested.
+    changes_during_reload: Option<HashSet<ThreadId>>,
+    /// Placeholder rows for views created before the first load, saved once it completes.
+    pending_placeholders: Vec<(gpui::WeakEntity<crate::ConversationView>, ThreadMetadata)>,
+    conversation_subscriptions: HashMap<gpui::EntityId, (ThreadId, [Subscription; 2])>,
+    pending_thread_ops_tx: async_channel::Sender<DbRequest>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
+}
+
+enum DbRequest {
+    Write(DbOperation),
+    Load(futures::channel::oneshot::Sender<anyhow::Result<Vec<ThreadMetadata>>>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -706,32 +722,66 @@ impl ThreadMetadataStore {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
-        let db = self.db.clone();
-        self.reload_task.take();
-
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        self.reload_generation += 1;
+        let generation = self.reload_generation;
+        self.changes_during_reload = Some(HashSet::default());
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.pending_thread_ops_tx
+            .try_send(DbRequest::Load(sender))
+            .log_err();
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some(rows) = receiver.await.log_err().and_then(|result| result.log_err())
+                else {
+                    this.update(cx, |this, _| {
+                        if this.reload_generation == generation {
+                            this.changes_during_reload = None;
+                        }
+                    })
+                    .ok();
                     return;
                 };
 
-                this.update(cx, |this, cx| {
+                let next_reload = this.update(cx, |this, cx| {
+                    if this.reload_generation != generation {
+                        return Some(this.reload_task());
+                    }
+                    let changes = this.changes_during_reload.take().unwrap_or_default();
+                    let local_rows: Vec<_> = changes
+                        .iter()
+                        .filter_map(|id| this.threads.remove(id))
+                        .collect();
                     this.threads.clear();
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
                     this.threads_by_session.clear();
 
-                    for row in rows {
+                    for row in rows
+                        .into_iter()
+                        .filter(|row| !changes.contains(&row.thread_id))
+                        .chain(local_rows)
+                    {
                         this.cache_thread_metadata(row);
                     }
                     this.is_loaded = true;
 
+                    for (view, placeholder) in std::mem::take(&mut this.pending_placeholders) {
+                        if view
+                            .upgrade()
+                            .is_some_and(|view| !view.read(cx).failed_to_start())
+                            && this.entry(placeholder.thread_id).is_none()
+                        {
+                            this.save(placeholder, cx);
+                        }
+                    }
+
                     cx.notify();
-                })
-                .ok();
+                    None
+                });
+                if let Ok(Some(next_reload)) = next_reload {
+                    next_reload.await;
+                }
             })
             .shared();
         self.reload_task = Some(reload_task.clone());
@@ -810,8 +860,15 @@ impl ThreadMetadataStore {
         }
 
         self.cache_thread_metadata(metadata.clone());
+        self.queue_write(DbOperation::Upsert(metadata));
+    }
+
+    fn queue_write(&mut self, operation: DbOperation) {
+        if let Some(changes) = &mut self.changes_during_reload {
+            changes.insert(operation.id());
+        }
         self.pending_thread_ops_tx
-            .try_send(DbOperation::Upsert(metadata))
+            .try_send(DbRequest::Write(operation))
             .log_err();
     }
 
@@ -1077,9 +1134,8 @@ impl ThreadMetadataStore {
                     .or_default()
                     .insert(*thread_id);
 
-                self.pending_thread_ops_tx
-                    .try_send(DbOperation::Upsert(thread.clone()))
-                    .log_err();
+                let operation = DbOperation::Upsert(thread.clone());
+                self.queue_write(operation);
             }
         }
 
@@ -1199,46 +1255,36 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Delete(thread_id))
-            .log_err();
+        self.queue_write(DbOperation::Delete(thread_id));
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
-    }
-
-    pub fn unarchived_draft_ids_matching(
-        &self,
-        matches: impl Fn(&ThreadMetadata) -> bool,
-    ) -> Vec<ThreadId> {
-        self.entries()
-            .filter(|thread| thread.is_draft() && !thread.archived && matches(thread))
-            .map(|thread| thread.thread_id)
-            .collect()
-    }
-
-    pub fn delete_all(
-        &mut self,
-        thread_ids: impl IntoIterator<Item = ThreadId>,
-        cx: &mut Context<Self>,
-    ) {
-        for thread_id in thread_ids {
-            self.delete(thread_id, cx);
-        }
     }
 
     fn new(db: ThreadMetadataDb, cx: &mut Context<Self>) -> Self {
         let weak_store = cx.weak_entity();
 
-        cx.observe_new::<crate::ConversationView>(move |_view, _window, cx| {
+        cx.observe_new::<crate::ConversationView>(move |view, _window, cx| {
+            let placeholder = Self::placeholder_metadata(view, cx);
             let view_entity = cx.entity();
             let entity_id = view_entity.entity_id();
+            let thread_id = view.thread_id;
 
             cx.on_release({
                 let weak_store = weak_store.clone();
-                move |_view, cx| {
+                move |view, cx| {
+                    let thread_id = view.thread_id;
+                    let never_started = !view.has_connected();
                     weak_store
-                        .update(cx, |store, _cx| {
+                        .update(cx, |store, cx| {
                             store.conversation_subscriptions.remove(&entity_id);
+                            // Another view of the same draft may still be starting.
+                            let has_other_view = store
+                                .conversation_subscriptions
+                                .values()
+                                .any(|(other_thread_id, _)| *other_thread_id == thread_id);
+                            if never_started && !has_other_view {
+                                store.discard_empty_draft(thread_id, cx);
+                            }
                         })
                         .ok();
                 }
@@ -1247,9 +1293,20 @@ impl ThreadMetadataStore {
 
             weak_store
                 .update(cx, |this, cx| {
-                    let subscription = cx.subscribe(&view_entity, Self::handle_conversation_event);
+                    let subscriptions = [
+                        cx.subscribe(&view_entity, Self::handle_conversation_event),
+                        cx.subscribe(&view_entity, Self::handle_conversation_state_change),
+                    ];
                     this.conversation_subscriptions
-                        .insert(entity_id, subscription);
+                        .insert(entity_id, (thread_id, subscriptions));
+                    if let Some(placeholder) = placeholder {
+                        if !this.is_loaded() {
+                            this.pending_placeholders
+                                .push((view_entity.downgrade(), placeholder));
+                        } else if this.entry(placeholder.thread_id).is_none() {
+                            this.save(placeholder, cx);
+                        }
+                    }
                 })
                 .ok();
         })
@@ -1259,10 +1316,20 @@ impl ThreadMetadataStore {
         let _db_operations_task = cx.background_spawn({
             let db = db.clone();
             async move {
-                while let Ok(first_update) = rx.recv().await {
-                    let mut updates = vec![first_update];
-                    while let Ok(update) = rx.try_recv() {
-                        updates.push(update);
+                while let Ok(first) = rx.recv().await {
+                    let mut updates = Vec::new();
+                    let mut load = None;
+                    // A load must see every write before it, including the last write in this batch.
+                    for request in
+                        std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    {
+                        match request {
+                            DbRequest::Write(operation) => updates.push(operation),
+                            DbRequest::Load(sender) => {
+                                load = Some(sender);
+                                break;
+                            }
+                        }
                     }
                     let updates = Self::dedup_db_operations(updates);
                     for operation in updates {
@@ -1275,6 +1342,12 @@ impl ThreadMetadataStore {
                             }
                         }
                     }
+                    if let Some(sender) = load {
+                        // A superseded reload may have dropped its receiver.
+                        sender
+                            .send(db.list().context("Failed to fetch sidebar metadata"))
+                            .ok();
+                    }
                 }
             }
         });
@@ -1286,13 +1359,16 @@ impl ThreadMetadataStore {
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
             reload_task: None,
+            reload_generation: 0,
             is_loaded: false,
+            changes_during_reload: None,
+            pending_placeholders: Vec::new(),
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
         };
-        let _ = this.reload(cx);
+        drop(this.reload(cx));
         this
     }
 
@@ -1307,6 +1383,73 @@ impl ThreadMetadataStore {
         ops.into_values().collect()
     }
 
+    /// The row a new thread gets before its session exists, so that it is listed
+    /// while the agent is still starting.
+    fn placeholder_metadata(view: &crate::ConversationView, cx: &App) -> Option<ThreadMetadata> {
+        let project = view.project().read(cx);
+        if view.is_unlisted() || view.root_session_id.is_some() || project.is_via_collab() {
+            return None;
+        }
+        let worktree_paths = project.worktree_paths(cx);
+        if worktree_paths.is_empty() && !project.is_local() {
+            return None;
+        }
+        let now = Utc::now();
+        Some(ThreadMetadata {
+            thread_id: view.thread_id,
+            session_id: None,
+            agent_id: view.agent_key().id(),
+            title: None,
+            title_override: None,
+            created_at: Some(now),
+            interacted_at: Some(now),
+            updated_at: now,
+            worktree_paths,
+            remote_connection: project.remote_connection_options(cx).cloned(),
+            archived: false,
+        })
+    }
+
+    fn handle_conversation_state_change(
+        &mut self,
+        conversation_view: Entity<crate::ConversationView>,
+        _event: &crate::conversation_view::StateChange,
+        cx: &mut Context<Self>,
+    ) {
+        let view = conversation_view.read(cx);
+        if view.failed_to_start() {
+            self.discard_empty_draft(view.thread_id, cx);
+        }
+    }
+
+    /// Starts listing a conversation that was created unlisted.
+    pub(crate) fn list_conversation(
+        &mut self,
+        conversation_view: Entity<crate::ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(placeholder) = Self::placeholder_metadata(conversation_view.read(cx), cx)
+            && self.entry(placeholder.thread_id).is_none()
+        {
+            self.save(placeholder, cx);
+        }
+        self.handle_conversation_event(
+            conversation_view,
+            &crate::conversation_view::RootThreadUpdated,
+            cx,
+        );
+    }
+
+    /// An empty draft whose session never started has nothing worth keeping.
+    fn discard_empty_draft(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if self.entry(thread_id).is_some_and(|thread| {
+            thread.is_draft() && thread.title.is_none() && thread.title_override.is_none()
+        }) && crate::draft_prompt_store::read(thread_id, cx).is_none()
+        {
+            self.delete(thread_id, cx);
+        }
+    }
+
     fn handle_conversation_event(
         &mut self,
         conversation_view: Entity<crate::ConversationView>,
@@ -1315,6 +1458,9 @@ impl ThreadMetadataStore {
     ) {
         let view = conversation_view.read(cx);
         let thread_id = view.thread_id;
+        if view.is_unlisted() {
+            return;
+        }
         let Some(thread) = view.root_thread(cx) else {
             return;
         };
@@ -1367,13 +1513,10 @@ impl ThreadMetadataStore {
                 (worktree_paths, remote_connection)
             };
 
-        // Threads without a folder path (e.g. started in an empty
-        // window) are archived by default so they don't get lost,
-        // because they won't show up in the sidebar. Users can reload
-        // them from the archive.
-        let archived = existing_thread
-            .map(|t| t.archived)
-            .unwrap_or(worktree_paths.is_empty());
+        let archived = existing_thread.map_or_else(
+            || worktree_paths.is_empty() && !thread_ref.project().read(cx).is_local(),
+            |thread| thread.archived,
+        );
 
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
         if was_draft && !is_draft {
@@ -1927,6 +2070,46 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    async fn test_discard_empty_draft_keeps_drafts_with_content(cx: &mut TestAppContext) {
+        init_test(cx);
+        let draft = |title: &str| ThreadMetadata {
+            session_id: None,
+            ..make_metadata("unused", title, Utc::now(), PathList::default())
+        };
+        let empty = draft("");
+        let titled = draft("Titled");
+        let with_prompt = draft("");
+        let ids = [empty.thread_id, titled.thread_id, with_prompt.thread_id];
+        cx.update(|cx| {
+            crate::draft_prompt_store::write(
+                with_prompt.thread_id,
+                &[acp::ContentBlock::Text(acp::TextContent::new("unsent"))],
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                for draft in [empty, titled, with_prompt] {
+                    store.save(draft, cx);
+                }
+                for id in ids {
+                    store.discard_empty_draft(id, cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        let is_listed = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            ids.map(|id| store.entry(id).is_some())
+        });
+        assert_eq!(is_listed, [false, true, true]);
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
@@ -2007,8 +2190,8 @@ mod tests {
             move |connection| {
                 connection.exec_bound::<(ThreadId, Arc<str>)>(
                     "INSERT INTO sidebar_threads \
-                     (thread_id, session_id, title, updated_at, archived) \
-                     VALUES (?1, ?2, 'Legacy thread', '2025-01-15T10:00:00Z', 0)",
+                     (thread_id, session_id, title, updated_at, archived, folder_paths) \
+                     VALUES (?1, ?2, 'Legacy thread', '2025-01-15T10:00:00Z', 0, '/legacy')",
                 )?((thread_id, session_id))
             }
         })
@@ -2024,6 +2207,11 @@ mod tests {
             metadata.session_id,
             Some(acp::SessionId::new(legacy_session_id.0.clone()))
         );
+        assert_eq!(
+            metadata.folder_paths(),
+            &PathList::new(&[Path::new("/legacy")])
+        );
+        assert_eq!(metadata.main_worktree_paths(), metadata.folder_paths());
         assert_eq!(metadata.thread_id, thread_id);
 
         metadata.title_override = Some("Renamed legacy thread".into());
@@ -2844,9 +3032,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_threads_without_project_association_are_archived_by_default(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_projectless_threads_are_listed_by_default(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -2896,8 +3082,8 @@ mod tests {
                 .expect("missing metadata for thread without project association");
             assert!(without_worktree.folder_paths().is_empty());
             assert!(
-                without_worktree.archived,
-                "expected thread without project association to be archived"
+                !without_worktree.archived,
+                "expected thread without project association to remain visible"
             );
 
             let with_worktree = store
@@ -3341,6 +3527,140 @@ mod tests {
             );
 
             assert_eq!(store.entry_ids().count(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reload_preserves_concurrent_writes_and_deletes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let paths = PathList::new(&[Path::new("/project")]);
+        let first = make_metadata("first", "First", Utc::now(), paths.clone());
+        let second = make_metadata("second", "Second", Utc::now(), paths.clone());
+        let first_id = first.thread_id;
+        let second_id = second.thread_id;
+        let retained = make_metadata("retained", "Retained", Utc::now(), paths.clone());
+        let retained_id = retained.thread_id;
+
+        let first_load = store.update(cx, |store, cx| {
+            store.save(first, cx);
+            let first_load = store.reload(cx);
+            store.save(retained, cx);
+            drop(store.reload(cx));
+            store.delete(first_id, cx);
+            store.save(second, cx);
+            first_load
+        });
+        first_load.await;
+
+        store.read_with(cx, |store, _| {
+            assert!(store.is_loaded());
+            assert!(store.entry(first_id).is_none());
+            assert!(
+                store
+                    .entry_by_session(&acp::SessionId::new("first"))
+                    .is_none()
+            );
+            let listed: HashSet<_> = store
+                .entries_for_path(&paths, None)
+                .map(|row| row.thread_id)
+                .collect();
+            assert_eq!(listed, [second_id, retained_id].into_iter().collect());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_failed_reload_keeps_store_loaded(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        let paths = PathList::new(&[Path::new("/project")]);
+        let rename_table = |from: &'static str, to: &'static str| {
+            db.write(move |connection| {
+                connection.exec(&format!("ALTER TABLE {from} RENAME TO {to}"))?()
+            })
+        };
+
+        rename_table("sidebar_threads", "sidebar_threads_hidden")
+            .await
+            .unwrap();
+        store.update(cx, |store, cx| store.reload(cx)).await;
+
+        let first = make_metadata("first", "First", Utc::now(), paths.clone());
+        let first_id = first.thread_id;
+        store.update(cx, |store, cx| {
+            assert!(store.is_loaded());
+            store.save(first, cx);
+            assert_eq!(store.changes_during_reload, None);
+        });
+        cx.run_until_parked();
+
+        rename_table("sidebar_threads_hidden", "sidebar_threads")
+            .await
+            .unwrap();
+        let second = make_metadata("second", "Second", Utc::now(), paths);
+        let second_id = second.thread_id;
+        store
+            .update(cx, |store, cx| {
+                store.save(second, cx);
+                store.reload(cx)
+            })
+            .await;
+
+        store.read_with(cx, |store, _| {
+            assert!(store.is_loaded());
+            assert_eq!(store.changes_during_reload, None);
+            assert!(store.entry(second_id).is_some());
+            // The write made while the table was missing never reached the database.
+            assert!(store.entry(first_id).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_opened_during_initial_load_gets_placeholder(cx: &mut TestAppContext) {
+        struct NeverConnectingAgentServer;
+
+        impl agent_servers::AgentServer for NeverConnectingAgentServer {
+            fn logo(&self) -> ui::IconName {
+                ui::IconName::ZedAgent
+            }
+
+            fn agent_id(&self) -> AgentId {
+                "Test".into()
+            }
+
+            fn connect(
+                &self,
+                _delegate: agent_servers::AgentServerDelegate,
+                _project: Entity<Project>,
+                cx: &mut App,
+            ) -> Task<gpui::Result<Rc<dyn acp_thread::AgentConnection>>> {
+                cx.spawn(async move |_| std::future::pending().await)
+            }
+
+            fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+                self
+            }
+        }
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+
+        panel.update_in(&mut vcx, |panel, window, cx| {
+            ThreadMetadataStore::init_global(cx);
+            assert!(!ThreadMetadataStore::global(cx).read(cx).is_loaded());
+            panel.open_external_thread_with_server(Rc::new(NeverConnectingAgentServer), window, cx);
+        });
+        vcx.run_until_parked();
+
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            assert!(store.is_loaded());
+            assert!(store.entry(thread_id).is_some());
         });
     }
 

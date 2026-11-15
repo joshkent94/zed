@@ -1184,6 +1184,7 @@ async fn test_linked_worktrees_sync(
             sha: "bbb222".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -1196,6 +1197,7 @@ async fn test_linked_worktrees_sync(
             sha: "ccc333".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;
@@ -1269,6 +1271,7 @@ async fn test_linked_worktrees_sync(
                 sha: "ddd444".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;

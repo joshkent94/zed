@@ -237,9 +237,10 @@ impl WorktreePicker {
             cx.spawn_in(window, async move |_this, cx| {
                 let all_worktrees: Vec<_> = match all_worktrees_request {
                     Some(req) => match req.await {
-                        Ok(Ok(worktrees)) => {
-                            worktrees.into_iter().filter(|wt| !wt.is_bare).collect()
-                        }
+                        Ok(Ok(worktrees)) => worktrees
+                            .into_iter()
+                            .filter(|wt| !wt.is_bare && !wt.is_prunable)
+                            .collect(),
                         Ok(Err(err)) => {
                             log::warn!("WorktreePicker: git worktree list failed: {err}");
                             picker_handle.update_in(cx, mark_worktrees_loaded).ok();
@@ -307,7 +308,7 @@ impl WorktreePicker {
                             let all_worktrees: Vec<_> = worktrees_request
                                 .await??
                                 .into_iter()
-                                .filter(|wt| !wt.is_bare)
+                                .filter(|wt| !wt.is_bare && !wt.is_prunable)
                                 .collect();
                             picker.update_in(cx, |picker, window, cx| {
                                 picker.delegate.all_worktrees = all_worktrees;
@@ -593,6 +594,7 @@ fn snapshot_worktrees(repository: &RepositorySnapshot) -> Option<Vec<GitWorktree
             .unwrap_or_default(),
         is_main: !repository.is_linked_worktree(),
         is_bare: false,
+        is_prunable: false,
     };
     Some(
         std::iter::once(current_worktree)
@@ -721,6 +723,7 @@ async fn load_delta_checkouts(
                             sha: SharedString::default(),
                             is_main: false,
                             is_bare: false,
+                            is_prunable: false,
                         },
                         Some(repo_identity_path(source_common_dir, path_style)),
                         None,
@@ -2851,6 +2854,7 @@ mod tests {
             sha: "8166e3d".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         };
         let worktrees = [worktree.clone()];
         let name_anchor = worktree_name_anchor(&worktrees, Some(Path::new("/repos/zed")));
@@ -3059,6 +3063,7 @@ mod tests {
                     sha: "deadbeef".into(),
                     is_main: false,
                     is_bare: false,
+                    is_prunable: false,
                 })
                 .collect();
             });
@@ -3156,6 +3161,7 @@ mod tests {
                         sha: "deadbeef".into(),
                         is_main: false,
                         is_bare: false,
+                        is_prunable: false,
                     })
                     .collect();
                     picker.delegate.update_matches("same".into(), window, cx)
@@ -3632,6 +3638,7 @@ mod tests {
             sha: "deadbeef".into(),
             is_main,
             is_bare: false,
+            is_prunable: false,
         };
         let delta_clone_path = Path::new("/store/clones/thread-alpha/repo.git");
         let names = [
@@ -5256,6 +5263,10 @@ mod tests {
             }),
         )
         .await;
+        // Without its directory, git would report the worktree as prunable.
+        fs.create_dir(Path::new(path!("/root/worktrees/fresh-wt")))
+            .await
+            .unwrap();
         let stale_picker = open_picker(&mut cx);
         let rows_at_open = shown_git_state(&stale_picker, &mut cx).1;
         wait_for_git_refresh(&stale_picker, &mut cx).await;

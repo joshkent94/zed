@@ -101,6 +101,7 @@ impl ThreadRecovery {
         session_id: Option<&acp_v2::SessionId>,
         recovery: Option<&Self>,
         saved_submissions: &[SavedSubmission],
+        pending_initial_prompt: Option<&str>,
     ) -> Result<String> {
         #[derive(serde::Serialize)]
         struct SavedInput<'a> {
@@ -110,9 +111,13 @@ impl ThreadRecovery {
             submissions: Vec<(&'a [acp_v2::ContentBlock], &'a SubmissionState)>,
         }
 
+        let initial_draft = pending_initial_prompt
+            .map(|prompt| acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt)));
         Ok(serde_json::to_string_pretty(&SavedInput {
             session_id,
-            draft: recovery.map_or(&[], |recovery| recovery.draft.as_slice()),
+            draft: recovery.map_or(initial_draft.as_slice(), |recovery| {
+                recovery.draft.as_slice()
+            }),
             queued: recovery
                 .into_iter()
                 .flat_map(|recovery| &recovery.queued)

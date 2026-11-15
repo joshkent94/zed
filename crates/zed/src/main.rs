@@ -50,7 +50,7 @@ use reqwest_client::ReqwestClient;
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
-use project::{Project, ProjectGroupKey, project_settings::ProjectSettings, trusted_worktrees};
+use project::{Project, project_settings::ProjectSettings, trusted_worktrees};
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
@@ -1281,7 +1281,7 @@ impl RequestedProject {
     async fn window_to_restore(
         &self,
         fs: &dyn Fs,
-        mut multi_workspace: workspace::SerializedMultiWorkspace,
+        multi_workspace: workspace::SerializedMultiWorkspace,
     ) -> Option<workspace::SerializedMultiWorkspace> {
         let saved = &multi_workspace.active_workspace;
         if saved.location != SerializedWorkspaceLocation::Local {
@@ -1290,14 +1290,6 @@ impl RequestedProject {
         if self.opens(fs, saved.paths.paths()).await {
             return None;
         }
-        let mut project_groups = Vec::new();
-        for group in std::mem::take(&mut multi_workspace.state.project_groups) {
-            let key = ProjectGroupKey::from(group.clone());
-            if key.host().is_some() || !self.opens(fs, key.path_list().paths()).await {
-                project_groups.push(group);
-            }
-        }
-        multi_workspace.state.project_groups = project_groups;
         Some(multi_workspace)
     }
 }
@@ -1363,13 +1355,11 @@ async fn restore_local_windows(
         let mut restoring = restoring
             .then({
                 let mut cx = cx.clone();
-                let fs = fs.clone();
                 let workspace_id = saved.workspace_id;
                 async move |window| {
                     let window = window?;
                     workspace::restore_native_window_state(window, workspace_id, &mut cx);
-                    workspace::apply_restored_multiworkspace_state(window, &state, fs, &mut cx)
-                        .await;
+                    workspace::apply_restored_multiworkspace_state(window, &state, &mut cx);
                     anyhow::Ok(window)
                 }
             })
@@ -1957,13 +1947,7 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await?;
-                        workspace::apply_restored_multiworkspace_state(
-                            window,
-                            &state,
-                            app_state.fs.clone(),
-                            cx,
-                        )
-                        .await;
+                        workspace::apply_restored_multiworkspace_state(window, &state, cx);
                         Ok::<(), anyhow::Error>(())
                     }
                     .await

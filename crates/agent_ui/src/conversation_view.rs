@@ -103,6 +103,9 @@ use crate::{
     ToggleThinkingMode, UndoLastReject,
 };
 
+/// Agents announce their commands shortly after a session starts, and some never do.
+const COMMANDS_ANNOUNCEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
 const TOKEN_THRESHOLD: u64 = 250;
 
@@ -820,13 +823,23 @@ pub struct ConversationView {
     connection_key: Agent,
     agent_server_store: Entity<AgentServerStore>,
     workspace: WeakEntity<Workspace>,
+    _folderless_thread_host: Option<Arc<()>>,
     project: Entity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
     server_state: ServerState,
     recovery: Option<ThreadRecovery>,
+    has_connected: bool,
     saved_submissions: Vec<SavedSubmission>,
+    pub(super) pending_initial_prompt: Option<String>,
+    /// The prompt's mentions and images, sent in place of `pending_initial_prompt` through the message editor.
+    pub(super) pending_initial_content: Option<Vec<acp_v2::ContentBlock>>,
+    /// Sends the prompt once the session announces its commands, or gives up waiting.
+    /// Holds the prompt's text, so a prompt the user has since sent or edited is left alone.
+    awaiting_commands: Option<(String, Task<()>)>,
+    /// Kept out of the thread list and draft storage until it is adopted by the panel.
+    unlisted: bool,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
@@ -875,7 +888,9 @@ impl ConversationView {
     }
 
     pub(crate) fn has_saved_input(&self) -> bool {
-        self.recovery.is_some() || !self.saved_submissions.is_empty()
+        self.pending_initial_prompt.is_some()
+            || self.recovery.is_some()
+            || !self.saved_submissions.is_empty()
     }
 
     pub fn pending_tool_call<'a>(
@@ -906,6 +921,52 @@ impl ConversationView {
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
+    }
+
+    /// Sends the message editor's prompt once the session can recognize the commands in it.
+    fn send_when_commands_announced(
+        &mut self,
+        view: Entity<ThreadView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The native agent's commands are known when its thread is built, and it announces none later if it has none.
+        let is_native = view.read(cx).as_native_thread(cx).is_some();
+        if is_native
+            || view
+                .read(cx)
+                .session_capabilities
+                .read()
+                .has_slash_completions()
+        {
+            view.update(cx, |view, cx| view.send(window, cx));
+            return;
+        }
+        let prompt = view.read(cx).message_editor.read(cx).text(cx);
+        let timeout = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(COMMANDS_ANNOUNCEMENT_TIMEOUT)
+                .await;
+            // An agent may never announce commands; sending lets the editor report any unknown one.
+            this.update_in(cx, |this, window, cx| {
+                this.send_awaited_prompt(&view, window, cx)
+            })
+            .log_err();
+        });
+        self.awaiting_commands = Some((prompt, timeout));
+    }
+
+    fn send_awaited_prompt(
+        &mut self,
+        view: &Entity<ThreadView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((prompt, _timeout)) = self.awaiting_commands.take()
+            && view.read(cx).message_editor.read(cx).text(cx) == prompt
+        {
+            view.update(cx, |view, cx| view.send(window, cx));
+        }
     }
 
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {
@@ -1153,6 +1214,7 @@ impl ConversationView {
             connection_key: connection_key.clone(),
             agent_server_store,
             workspace,
+            _folderless_thread_host: project.read(cx).retain_folderless_thread_host(cx),
             project: project.clone(),
             thread_store,
             thread_id,
@@ -1172,7 +1234,12 @@ impl ConversationView {
                 cx,
             ),
             recovery: None,
+            has_connected: false,
             saved_submissions: Vec::new(),
+            pending_initial_prompt: None,
+            pending_initial_content: None,
+            awaiting_commands: None,
+            unlisted: false,
             pending_selections: Vec::new(),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
@@ -1215,6 +1282,7 @@ impl ConversationView {
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
+            self.has_connected = true;
             cx.emit(RootThreadUpdated);
         }
         cx.notify();
@@ -1363,7 +1431,14 @@ impl ConversationView {
                 ),
             };
         }
-        let session_work_dirs = work_dirs.unwrap_or_else(|| project.read(cx).default_path_list(cx));
+        let project_ref = project.read(cx);
+        let session_work_dirs = work_dirs
+            .filter(|dirs| {
+                !dirs.is_empty()
+                    || !project_ref.is_local()
+                    || project_ref.visible_worktrees(cx).next().is_some()
+            })
+            .unwrap_or_else(|| project_ref.default_path_list(cx));
 
         let connection_entry = connection_store.update(cx, |store, cx| {
             store.request_connection(connection_key, agent.clone(), cx)
@@ -1572,6 +1647,29 @@ impl ConversationView {
                             }),
                             cx,
                         );
+                        if let Some(view) = this.root_thread_view()
+                            && let Some(prompt) = this.pending_initial_prompt.take()
+                        {
+                            if let Some(content) = this.pending_initial_content.take() {
+                                view.update(cx, |view, cx| {
+                                    cx.emit(AcpThreadViewEvent::Interacted);
+                                    view.message_editor.update(cx, |editor, cx| {
+                                        editor.set_message(content, window, cx)
+                                    });
+                                });
+                                this.send_when_commands_announced(view, window, cx);
+                            } else {
+                                // The message editor trims whitespace. A prompt submitted in the modal is already final.
+                                let blocks = vec![acp_v2::ContentBlock::Text(
+                                    acp_v2::TextContent::new(prompt),
+                                )];
+                                view.update(cx, |view, cx| {
+                                    cx.emit(AcpThreadViewEvent::Interacted);
+                                    let contents = Task::ready(Ok(Some((blocks, Vec::new()))));
+                                    view.send_content(contents, false, window, cx);
+                                });
+                            }
+                        }
                         if let Some(recovery) = this.recovery.take() {
                             this.saved_submissions.extend(recovery.submissions);
                         }
@@ -1994,6 +2092,37 @@ impl ConversationView {
 
     pub fn agent_key(&self) -> &Agent {
         &self.connection_key
+    }
+
+    pub(crate) fn project(&self) -> &Entity<Project> {
+        &self.project
+    }
+
+    pub(crate) fn has_connected(&self) -> bool {
+        self.has_connected
+    }
+
+    /// Whether the agent is waiting for the user to sign in before a session can start.
+    pub fn needs_authentication(&self) -> bool {
+        self.as_connected()
+            .is_some_and(|connected| !connected.auth_state.is_ok())
+    }
+
+    pub(crate) fn is_unlisted(&self) -> bool {
+        self.unlisted
+    }
+
+    pub(crate) fn set_unlisted(&mut self, unlisted: bool) {
+        self.unlisted = unlisted;
+    }
+
+    pub fn message_editor(&self, cx: &App) -> Option<Entity<MessageEditor>> {
+        Some(self.root_thread_view()?.read(cx).message_editor.clone())
+    }
+
+    /// A lost connection also ends in a load error, but leaves input worth keeping.
+    pub fn failed_to_start(&self) -> bool {
+        !self.has_connected && matches!(self.server_state, ServerState::LoadError { .. })
     }
 
     /// User renames are stored in ThreadMetadataStore.
@@ -2451,6 +2580,9 @@ impl ConversationView {
                             editor.set_placeholder_text(&new_placeholder, window, cx);
                         });
                     });
+                    if self.root_thread_view().as_ref() == Some(&thread_view) {
+                        self.send_awaited_prompt(&thread_view, window, cx);
+                    }
                 }
             }
             AcpThreadEvent::ModeUpdated(_mode) => {
@@ -2470,7 +2602,7 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::PromptUpdated => {
-                if !is_subagent && thread.read(cx).is_draft_thread() {
+                if !is_subagent && !self.unlisted && thread.read(cx).is_draft_thread() {
                     self.schedule_draft_prompt_persist(cx);
                 }
                 cx.notify();
@@ -3411,6 +3543,7 @@ impl ConversationView {
                             this.root_session_id.as_ref(),
                             this.recovery.as_ref(),
                             &this.saved_submissions,
+                            this.pending_initial_prompt.as_deref(),
                         ) {
                             Ok(saved) => {
                                 cx.write_to_clipboard(ClipboardItem::new_string(saved));
@@ -8735,6 +8868,91 @@ pub(crate) mod tests {
                 "Expected refusal error to be set"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_new_thread_is_listed_until_its_session_fails_to_start(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "src": {} })).await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(FailingAgentServer),
+                    connection_store.clone(),
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+        let is_listed = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::thread_metadata_store::ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some()
+            })
+        };
+        assert!(is_listed(cx), "listed before the session exists");
+
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| assert!(view.failed_to_start()));
+        assert!(!is_listed(cx), "discarded once the session failed to start");
+    }
+
+    #[gpui::test]
+    async fn test_draft_stays_listed_when_its_connection_is_lost(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+        let is_listed = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::thread_metadata_store::ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_some()
+            })
+        };
+        assert!(is_listed(cx));
+
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::LoadError(LoadError::Other(
+                "connection lost".into(),
+            )));
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, _| {
+            assert!(matches!(view.server_state, ServerState::LoadError { .. }));
+        });
+        assert!(
+            is_listed(cx),
+            "typed input may not be persisted yet when a connection is lost"
+        );
     }
 
     #[gpui::test]

@@ -114,20 +114,20 @@ else
 fi
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} ${remote_server_features} --package remote_server --target $target_triple
+if [ "$local_install" != true ]; then
+    cargo --config .cargo/bundle-config.toml build ${build_flag} ${remote_server_features} --package remote_server --target $target_triple
+fi
 
 echo "Creating application bundle"
-pushd crates/zed
-cp Cargo.toml Cargo.toml.backup
-sed \
-    -i.backup \
-    "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
-    Cargo.toml
-
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
-
-mv Cargo.toml.backup Cargo.toml
-popd
+app_path=$(
+    set -e
+    cd crates/zed
+    cp Cargo.toml Cargo.toml.backup
+    trap 'mv Cargo.toml.backup Cargo.toml' EXIT
+    sed "s/package.metadata.bundle-${channel}/package.metadata.bundle/" Cargo.toml.backup > Cargo.toml
+    # cargo-bundle panics when its terminal type supports no colors.
+    TERM=xterm-256color cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs
+)
 echo "Bundled ${app_path}"
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
@@ -270,6 +270,7 @@ function sign_app_binaries() {
             echo "Opening /Applications/$bundle_name"
             open "/Applications/$bundle_name"
         fi
+        return
     elif [ "$open_result" = true ]; then
         open "$app_path"
     fi
@@ -388,7 +389,12 @@ fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+if [ "$local_install" = true ]; then
+    strip -x "${app_path}/Contents/MacOS/zed" "${app_path}/Contents/MacOS/cli"
+fi
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote-server"
-gzip -f --stdout --best target/$target_triple/release/remote-server > target/zed-remote-server-macos-$arch_suffix.gz
+if [ "$local_install" != true ]; then
+    sign_binary "target/$target_triple/release/remote-server"
+    gzip -f --stdout --best target/$target_triple/release/remote-server > target/zed-remote-server-macos-$arch_suffix.gz
+fi

@@ -301,6 +301,49 @@ impl From<WindowBoundsJson> for WindowBounds {
     }
 }
 
+pub(crate) const SHARED_PROJECT_GROUPS_KEY: &str = "sidebar_project_groups";
+
+pub(crate) fn read_shared_project_groups(
+    cx: &App,
+) -> Result<Vec<crate::multi_workspace::ProjectGroupState>> {
+    let kvp = KeyValueStore::global(cx);
+    if let Some(json) = kvp.read_kvp(SHARED_PROJECT_GROUPS_KEY)?
+        && let Some(groups) = serde_json::from_str::<Vec<model::SerializedProjectGroup>>(&json)
+            .context("invalid shared sidebar project groups")
+            .log_err()
+    {
+        return Ok(groups
+            .into_iter()
+            .map(model::SerializedProjectGroup::into_restored_state)
+            .collect());
+    }
+
+    // Window records are replaced on save, so descending rowid visits the newest layout first.
+    let windows = kvp.select::<String>(
+        "SELECT value FROM scoped_kv_store WHERE namespace = 'multi_workspace_state' ORDER BY rowid DESC"
+    )?()?;
+    let mut groups = collections::IndexMap::default();
+    for json in windows {
+        let Some(window) = serde_json::from_str::<model::MultiWorkspaceState>(&json).log_err()
+        else {
+            continue;
+        };
+        for serialized in window.project_groups {
+            let group = serialized.into_restored_state();
+            if group.key.path_list().is_empty() {
+                continue;
+            }
+            let existing = groups
+                .entry(group.key.clone())
+                .or_insert_with(|| group.clone());
+            if existing.custom_name.is_none() {
+                existing.custom_name = group.custom_name;
+            }
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
 fn read_multi_workspace_state(window_id: WindowId, cx: &App) -> model::MultiWorkspaceState {
     let kvp = KeyValueStore::global(cx);
     kvp.scoped("multi_workspace_state")
@@ -7547,7 +7590,9 @@ mod tests {
 
         // The restored window should have the same project group keys.
         let restored_keys: Vec<ProjectGroupKey> = restored_handle
-            .read_with(cx, |mw: &MultiWorkspace, _cx| mw.project_group_keys())
+            .read_with(cx, |multi_workspace: &MultiWorkspace, cx| {
+                multi_workspace.project_group_keys(cx)
+            })
             .unwrap();
         assert_eq!(
             restored_keys, expected_keys,

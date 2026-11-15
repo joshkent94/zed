@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -260,24 +260,6 @@ impl TerminalThreadMetadataStore {
                 terminal.remote_connection.as_ref().map(|o| o.identity())
                     == remote_connection.map(|o| o.identity())
             })
-    }
-
-    pub fn path_is_referenced_by_terminal(
-        &self,
-        terminal_id: Option<TerminalId>,
-        path: &Path,
-        remote_connection: Option<&RemoteConnectionOptions>,
-    ) -> bool {
-        self.entries().any(|terminal| {
-            Some(terminal.terminal_id) != terminal_id
-                && terminal.remote_connection.as_ref().map(|o| o.identity())
-                    == remote_connection.map(|o| o.identity())
-                && terminal
-                    .folder_paths()
-                    .paths()
-                    .iter()
-                    .any(|folder_path| folder_path.as_path() == path)
-        })
     }
 
     pub fn save(&mut self, metadata: TerminalThreadMetadata, cx: &mut Context<Self>) {

@@ -355,7 +355,7 @@ async fn remove_root_after_worktree_removal(
 /// Future improvement: decoupling `GitStore` from `Project` so that
 /// `Repository` entities can be created standalone would eliminate this
 /// temporary-project workaround.
-async fn find_or_create_repository(
+pub async fn find_or_create_repository(
     repo_path: &Path,
     remote_connection: Option<&RemoteConnectionOptions>,
     cx: &mut AsyncApp,
@@ -1057,6 +1057,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1144,6 +1145,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1208,6 +1210,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1288,6 +1291,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1311,6 +1315,7 @@ mod tests {
                 sha: "def456".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1394,6 +1399,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1476,6 +1482,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1564,6 +1571,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;
@@ -1677,6 +1685,7 @@ mod tests {
                 sha: "abc123".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             },
         )
         .await;

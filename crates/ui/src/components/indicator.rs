@@ -13,6 +13,7 @@ enum IndicatorKind {
 pub struct Indicator {
     kind: IndicatorKind,
     border_color: Option<Color>,
+    dot_size: Option<Pixels>,
     pub color: Color,
 }
 
@@ -21,6 +22,7 @@ impl Indicator {
         Self {
             kind: IndicatorKind::Dot,
             border_color: None,
+            dot_size: None,
             color: Color::Default,
         }
     }
@@ -29,6 +31,7 @@ impl Indicator {
         Self {
             kind: IndicatorKind::Bar,
             border_color: None,
+            dot_size: None,
 
             color: Color::Default,
         }
@@ -38,6 +41,7 @@ impl Indicator {
         Self {
             kind: IndicatorKind::Icon(icon.into()),
             border_color: None,
+            dot_size: None,
 
             color: Color::Default,
         }
@@ -45,6 +49,11 @@ impl Indicator {
 
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    pub fn dot_size(mut self, size: Pixels) -> Self {
+        self.dot_size = Some(size);
         self
     }
 
@@ -71,8 +80,10 @@ impl RenderOnce for Indicator {
             IndicatorKind::Icon(icon) => container
                 .child(icon.map(|icon| icon.custom_size(rems_from_px(8_f32)).color(self.color))),
             IndicatorKind::Dot => container
-                .w_1p5()
-                .h_1p5()
+                .map(|this| match self.dot_size {
+                    Some(size) => this.size(size),
+                    None => this.w_1p5().h_1p5(),
+                })
                 .rounded_full()
                 .bg(self.color.color(cx)),
             IndicatorKind::Bar => container

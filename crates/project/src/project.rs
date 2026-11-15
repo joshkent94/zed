@@ -253,6 +253,7 @@ pub struct Project {
     toolchain_store: Option<Entity<ToolchainStore>>,
     agent_location: Option<AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
+    folderless_thread_host: Arc<()>,
     last_worktree_paths: WorktreePaths,
 }
 
@@ -1487,6 +1488,7 @@ impl Project {
 
                 agent_location: None,
                 downloading_files: Default::default(),
+                folderless_thread_host: Arc::default(),
                 last_worktree_paths: WorktreePaths::default(),
             }
         })
@@ -1729,6 +1731,7 @@ impl Project {
                 toolchain_store: Some(toolchain_store),
                 agent_location: None,
                 downloading_files: Default::default(),
+                folderless_thread_host: Arc::default(),
                 last_worktree_paths: WorktreePaths::default(),
             };
 
@@ -2022,6 +2025,7 @@ impl Project {
                 toolchain_store: None,
                 agent_location: None,
                 downloading_files: Default::default(),
+                folderless_thread_host: Arc::default(),
                 last_worktree_paths: WorktreePaths::default(),
             };
             project.set_role(role, cx);
@@ -2547,6 +2551,17 @@ impl Project {
                 }
             })
             .collect()
+    }
+
+    /// Keeps a local, folderless project available to the session when another folder opens.
+    pub fn retain_folderless_thread_host(&self, cx: &App) -> Option<Arc<()>> {
+        (self.is_local() && self.visible_worktrees(cx).next().is_none())
+            .then(|| self.folderless_thread_host.clone())
+    }
+
+    pub fn hosts_folderless_threads(&self, cx: &App) -> bool {
+        Arc::strong_count(&self.folderless_thread_host) > 1
+            && self.visible_worktrees(cx).next().is_none()
     }
 
     pub fn default_path_list(&self, cx: &App) -> PathList {
@@ -6916,6 +6931,22 @@ impl ProjectGroupKey {
         &self.paths
     }
 
+    pub fn path_detail_map<'a>(
+        keys: impl IntoIterator<Item = &'a ProjectGroupKey>,
+    ) -> std::collections::HashMap<PathBuf, usize> {
+        let mut all_paths: Vec<PathBuf> = keys
+            .into_iter()
+            .flat_map(|key| key.paths.paths().iter().cloned())
+            .collect();
+        all_paths.sort_unstable();
+        all_paths.dedup();
+        let path_details =
+            util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
+                path_suffix(path, detail)
+            });
+        all_paths.into_iter().zip(path_details).collect()
+    }
+
     pub fn display_name(
         &self,
         path_detail_map: &std::collections::HashMap<PathBuf, usize>,
@@ -6938,7 +6969,7 @@ impl ProjectGroupKey {
         if names.is_empty() {
             "Empty Workspace".into()
         } else {
-            names.join(", ").into()
+            names.join(" / ").into()
         }
     }
 

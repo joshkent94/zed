@@ -1825,4 +1825,14 @@
       "escape": "tabular_data::ClearSelection",
     },
   },
+  {
+    "context": "NewThreadModal > Editor && !showing_completions",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "shift-enter": "editor::Newline",
+      "escape": "menu::Cancel",
+      "tab": "menu::SelectNext",
+      "shift-tab": "menu::SelectPrevious"
+    }
+  },
 ]

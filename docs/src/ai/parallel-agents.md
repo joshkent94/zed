@@ -13,7 +13,9 @@ Use **Panel Layout > Agentic** from the user menu in the title bar (or the {#act
 
 ## Threads Sidebar {#threads-sidebar}
 
-The sidebar shows your threads grouped by project. Each project gets its own section with a header. Threads appear below with their title, status indicator, and which agent is running them. Threads running in linked Git worktrees appear under the same project as their main worktree. See [Worktree Isolation](#worktree-isolation).
+Hover over **No Project** at the top of the sidebar and click `+` to start a thread without opening a folder. With the sidebar focused, you can also run {#action agents_sidebar::NewProjectlessThread}. You can do this while another project is open. The agent runs in your home directory, and the thread stays in **No Project** when you switch projects or restore it from Thread History.
+
+Below **No Project**, the sidebar shows your threads grouped by project. Each project gets its own section with a header. Threads appear below with their title, status indicator, and which agent is running them. Threads running in linked Git worktrees appear under the same project as their main worktree. See [Worktree Isolation](#worktree-isolation).
 
 Terminal Threads also appear as entries in the sidebar alongside agent threads, identified by a terminal icon. Click one to switch to it.
 
@@ -67,7 +69,7 @@ The Threads Sidebar can hold different thread types:
 
 ## Multiple Projects {#multiple-projects}
 
-The Threads Sidebar can hold multiple projects at once. Each project gets its own group with its own threads and conversation history. This mirrors how Zed handles projects in general — see [Windows & Projects](../windows-and-projects.md) for more on how projects open and how to manage them.
+The Threads Sidebar can hold multiple projects at once. Each project gets its own group with its own threads and conversation history. All windows share the project list, its order, custom project names, and which project groups are expanded. Zed restores these when you restart. Closing a project in one window keeps its sidebar group while another window still has that project open. This mirrors how Zed handles projects in general — see [Windows & Projects](../windows-and-projects.md) for more on how projects open and how to manage them.
 
 To add another project to the sidebar, click the **Add Project** button (open-folder icon) in the sidebar bottom bar. The popover that opens lists your recent projects and also provides **Add Local Folders** and **Add Remote Folder** buttons at the bottom.
 
@@ -89,7 +91,7 @@ Once you're in a new worktree, use the branch picker next to the worktree picker
 
 To automate setup steps whenever a new worktree is created, use a [Task hook](../tasks.md#hooks). The `create_worktree` hook runs automatically after Zed creates a linked worktree, with `ZED_WORKTREE_ROOT` pointing at the new worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository.
 
-After the agent finishes, review the diff and merge the changes through your normal Git workflow. If the thread was running in a linked worktree and no other active threads use it, moving the thread to Thread History saves the worktree's Git state and removes it from disk. Restoring the thread from history restores the worktree.
+After the agent finishes, review the diff and merge the changes through your normal Git workflow. Archiving a thread or closing a Terminal Thread leaves its linked worktree on disk. To remove the checkout, choose **Delete Worktree** in the worktree header.
 
 ## See Also {#see-also}
 

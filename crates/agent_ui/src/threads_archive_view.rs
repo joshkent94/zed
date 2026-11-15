@@ -447,7 +447,7 @@ impl ThreadsArchiveView {
             return;
         }
 
-        if thread.folder_paths().is_empty() {
+        if thread.folder_paths().is_empty() && !thread.is_projectless() {
             self.show_project_picker_for_thread(thread, window, cx);
             return;
         }
@@ -615,8 +615,7 @@ impl ThreadsArchiveView {
                 highlight_positions,
             } => {
                 let id = SharedString::from(format!("archive-entry-{}", ix));
-                let color = cx.theme().colors();
-                let button_hover_bg = color.element_background;
+                let button_hover_bg = ui::sidebar_action_hover_background(cx);
 
                 let is_focused = self.selection == Some(ix);
                 let is_hovered = self.hovered_index == Some(ix);
@@ -659,7 +658,6 @@ impl ThreadsArchiveView {
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
 
                 let base = ThreadItem::new(id, thread.display_title())
-                    .base_bg(cx.theme().colors().panel_background)
                     .icon(icon)
                     .when(is_archived, |this| {
                         this.archived(true)

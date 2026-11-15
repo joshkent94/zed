@@ -4571,6 +4571,7 @@ async fn test_remote_root_repo_common_dir(cx: &mut TestAppContext, server_cx: &m
             sha: "abc123".into(),
             is_main: false,
             is_bare: false,
+            is_prunable: false,
         },
     )
     .await;

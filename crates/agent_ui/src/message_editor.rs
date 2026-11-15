@@ -2279,6 +2279,53 @@ fn mention_to_content_block(
     }
 }
 
+/// Points file mentions at their counterparts under another root, such as a newly created worktree.
+/// Remapped text mentions become links, because content read from the old root may differ in the new one.
+pub fn remap_mention_paths(
+    blocks: Vec<acp_v2::ContentBlock>,
+    path_style: PathStyle,
+    remap: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Vec<acp_v2::ContentBlock> {
+    let remap_uri = |uri: &str| {
+        let mut mention = MentionUri::parse(uri, path_style).ok()?;
+        let abs_path = match &mut mention {
+            MentionUri::File { abs_path }
+            | MentionUri::Directory { abs_path }
+            | MentionUri::Symbol { abs_path, .. }
+            | MentionUri::Selection {
+                abs_path: Some(abs_path),
+                ..
+            } => abs_path,
+            _ => return None,
+        };
+        *abs_path = remap(abs_path)?;
+        Some(mention)
+    };
+    blocks
+        .into_iter()
+        .map(|block| {
+            let mention = match &block {
+                acp_v2::ContentBlock::ResourceLink(link) => remap_uri(&link.uri),
+                acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource {
+                    resource: acp_v2::EmbeddedResourceResource::TextResourceContents(resource),
+                    ..
+                }) => remap_uri(&resource.uri),
+                acp_v2::ContentBlock::Image(image) => image.uri.as_deref().and_then(remap_uri),
+                _ => None,
+            };
+            match (block, mention) {
+                (acp_v2::ContentBlock::Image(image), Some(mention)) => {
+                    acp_v2::ContentBlock::Image(image.uri(Some(mention.to_uri().to_string())))
+                }
+                (_, Some(mention)) => acp_v2::ContentBlock::ResourceLink(
+                    acp_v2::ResourceLink::new(mention.name(), mention.to_uri().to_string()),
+                ),
+                (block, None) => block,
+            }
+        })
+        .collect()
+}
+
 /// Parses markdown mention links in the format `[@name](uri)` from text.
 /// Returns a vector of (range, MentionUri) pairs where range is the byte range in the text.
 fn parse_mention_links(text: &str, path_style: PathStyle) -> Vec<(Range<usize>, MentionUri)> {

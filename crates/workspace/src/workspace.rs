@@ -1470,6 +1470,9 @@ impl AppState {
         use session::Session;
         use settings::SettingsStore;
 
+        if !cx.has_global::<db::AppDatabase>() {
+            cx.set_global(db::AppDatabase::test_new());
+        }
         if !cx.has_global::<SettingsStore>() {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -4210,9 +4213,9 @@ impl Workspace {
         // Sort the paths to ensure we add worktrees for parents before their children.
         abs_paths.sort_unstable();
         cx.spawn_in(window, async move |workspace, cx| {
-            let mut tasks = Vec::with_capacity(abs_paths.len());
+            let mut visibility = Vec::with_capacity(abs_paths.len());
 
-            for abs_path in &abs_paths {
+            for abs_path in &caller_ordered_abs_paths {
                 let visible = match options.visible.as_ref().unwrap_or(&OpenVisible::None) {
                     OpenVisible::All => Some(true),
                     OpenVisible::None => Some(false),
@@ -4227,6 +4230,52 @@ impl Workspace {
                         None => None,
                     },
                 };
+                visibility.push(visible);
+            }
+
+            let (workspace, pane) = if visibility.contains(&Some(true))
+                && let Ok(Some(multi_workspace)) = workspace.read_with(cx, |workspace, cx| {
+                    workspace
+                        .multi_workspace()
+                        .and_then(WeakEntity::upgrade)
+                        .filter(|_| workspace.project().read(cx).hosts_folderless_threads(cx))
+                }) {
+                let roots: Vec<_> = caller_ordered_abs_paths
+                    .iter()
+                    .zip(&visibility)
+                    .filter_map(|(path, visible)| (*visible == Some(true)).then_some(path))
+                    .collect();
+                let opened = async {
+                    multi_workspace
+                        .update_in(cx, |multi_workspace, window, cx| {
+                            multi_workspace.find_or_create_local_workspace(
+                                PathList::new(&roots),
+                                None,
+                                None,
+                                OpenMode::Activate,
+                                None,
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await
+                }
+                .await;
+                match opened {
+                    Ok(destination) => (destination.downgrade(), None),
+                    Err(error) => {
+                        return abs_paths
+                            .iter()
+                            .map(|_| Some(Err(anyhow!("{error:#}"))))
+                            .collect();
+                    }
+                }
+            } else {
+                (workspace, pane)
+            };
+            let mut tasks = Vec::with_capacity(abs_paths.len());
+            for (abs_path, caller_index) in abs_paths.iter().zip(&caller_indices) {
+                let visible = visibility.get(*caller_index).copied().flatten();
                 let project_path = match visible {
                     Some(visible) => match workspace
                         .update(cx, |workspace, cx| {
@@ -10844,7 +10893,7 @@ pub async fn restore_multiworkspace(
         }
     };
 
-    apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
+    apply_restored_multiworkspace_state(window_handle, &state, cx);
 
     window_handle
         .update(cx, |_, window, _cx| {
@@ -10893,58 +10942,16 @@ pub fn open_saved_workspace(
     }
 }
 
-pub async fn apply_restored_multiworkspace_state(
+pub fn apply_restored_multiworkspace_state(
     window_handle: WindowHandle<MultiWorkspace>,
     state: &MultiWorkspaceState,
-    fs: Arc<dyn fs::Fs>,
     cx: &mut AsyncApp,
 ) {
     let MultiWorkspaceState {
         sidebar_open,
-        project_groups,
         sidebar_state,
         ..
     } = state;
-
-    if !project_groups.is_empty() {
-        // Resolve linked worktree paths to their main repo paths so
-        // stale keys from previous sessions get normalized and deduped.
-        let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
-        for serialized in project_groups.iter().cloned() {
-            let SerializedProjectGroupState { key, expanded } = serialized.into_restored_state();
-            if key.path_list().paths().is_empty() {
-                continue;
-            }
-            let mut resolved_paths = Vec::new();
-            for path in key.path_list().paths() {
-                if key.host().is_none()
-                    && let Some(common_dir) =
-                        project::discover_root_repo_common_dir(path, fs.as_ref()).await
-                    && !project::is_submodule_git_dir(&common_dir)
-                {
-                    let main_path = project::repo_identity_path(&common_dir, PathStyle::local());
-                    resolved_paths.push(main_path.to_path_buf());
-                } else {
-                    resolved_paths.push(path.to_path_buf());
-                }
-            }
-            let resolved =
-                ProjectGroupKey::new(key.host().cloned(), PathList::new(&resolved_paths));
-            if !resolved_groups.iter().any(|g| g.key == resolved) {
-                resolved_groups.push(SerializedProjectGroupState {
-                    key: resolved,
-                    expanded,
-                });
-            }
-        }
-
-        window_handle
-            .update(cx, |multi_workspace, _window, cx| {
-                multi_workspace.restore_project_groups(resolved_groups, cx);
-            })
-            .ok();
-    }
-
     if *sidebar_open {
         window_handle
             .update(cx, |multi_workspace, _, cx| {
@@ -11842,6 +11849,15 @@ pub fn open_paths(
                     })
                     .or(reuse_target);
             }
+        }
+
+        if let Some(host) = reuse_target.take_if(|target| {
+            !matches!(target.visible, OpenVisible::None)
+                && target.workspace.read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).hosts_folderless_threads(cx)
+                })
+        }) {
+            creation_window = Some(host.window);
         }
 
         // Fallback for directories: when no flag is specified and no existing

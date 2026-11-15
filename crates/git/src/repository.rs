@@ -274,6 +274,8 @@ pub struct Worktree {
     pub sha: SharedString,
     pub is_main: bool,
     pub is_bare: bool,
+    /// Still registered in git, but its directory is missing.
+    pub is_prunable: bool,
 }
 
 /// Describes how a new worktree should choose or create its checked-out HEAD.
@@ -371,6 +373,7 @@ pub fn parse_worktrees_from_str<T: AsRef<str>>(
         let mut ref_name = None;
 
         let mut is_bare = false;
+        let mut is_prunable = false;
 
         for line in entry.lines() {
             let line = line.trim();
@@ -385,8 +388,10 @@ pub fn parse_worktrees_from_str<T: AsRef<str>>(
                 ref_name = Some(rest.to_string());
             } else if line == "bare" {
                 is_bare = true;
+            } else if line == "prunable" || line.starts_with("prunable ") {
+                is_prunable = true;
             }
-            // Ignore other lines: detached, locked, prunable, etc.
+            // Ignore other lines: detached, locked, etc.
         }
 
         if let (Some(path), Some(sha)) = (path, sha) {
@@ -399,6 +404,7 @@ pub fn parse_worktrees_from_str<T: AsRef<str>>(
                 sha: sha.into(),
                 is_main,
                 is_bare,
+                is_prunable,
             });
         }
     }
@@ -6259,6 +6265,7 @@ mod tests {
                 sha: "8166e3d".into(),
                 is_main: false,
                 is_bare: false,
+                is_prunable: false,
             };
 
             assert_eq!(
@@ -6327,24 +6334,27 @@ mod tests {
         assert!(!result[1].is_main);
         assert!(!result[1].is_bare);
 
-        // Extra porcelain lines (locked, prunable) should be ignored
+        // A locked worktree is listed, and so is a prunable one, flagged as such
         let input = "worktree /home/user/project\nHEAD abc123\nbranch refs/heads/main\n\n\
                       worktree /home/user/locked-wt\nHEAD def456\nbranch refs/heads/locked-branch\nlocked\n\n\
-                      worktree /home/user/prunable-wt\nHEAD 789aaa\nbranch refs/heads/prunable-branch\nprunable\n\n";
+                      worktree /home/user/prunable-wt\nHEAD 789aaa\nbranch refs/heads/prunable-branch\nprunable gitdir file points to non-existent location\n\n";
         let result = parse_worktrees_from_str(input, Some(Path::new("/home/user/project")));
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].path, PathBuf::from("/home/user/project"));
         assert_eq!(result[0].ref_name, Some("refs/heads/main".into()));
         assert!(result[0].is_main);
+        assert!(!result[0].is_prunable);
         assert_eq!(result[1].path, PathBuf::from("/home/user/locked-wt"));
         assert_eq!(result[1].ref_name, Some("refs/heads/locked-branch".into()));
         assert!(!result[1].is_main);
+        assert!(!result[1].is_prunable);
         assert_eq!(result[2].path, PathBuf::from("/home/user/prunable-wt"));
         assert_eq!(
             result[2].ref_name,
             Some("refs/heads/prunable-branch".into())
         );
         assert!(!result[2].is_main);
+        assert!(result[2].is_prunable);
 
         // Leading/trailing whitespace on lines should be tolerated
         let input =
@@ -6532,6 +6542,7 @@ mod tests {
             sha: "abc123".into(),
             is_main: false,
             is_bare,
+            is_prunable: false,
         };
         let indices = [
             (

@@ -9799,12 +9799,13 @@ impl Repository {
 
     pub fn remove_worktree(&mut self, path: PathBuf, force: bool) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
+        let this = self.this.clone();
         let repository_anchor_path: Arc<Path> = self.linked_worktree_anchor_path().into();
         self.send_job(
             "remove_worktree",
             Some(format!("git worktree remove: {}", path.display()).into()),
-            move |repo, cx| async move {
-                match repo {
+            move |repo, mut cx| async move {
+                let removed: Result<()> = match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, fs, .. }) => {
                         // When forcing, delete the worktree directory ourselves before
                         // invoking git. `git worktree remove` can remove the admin
@@ -9874,9 +9875,31 @@ impl Repository {
 
                         Ok(())
                     }
-                }
+                };
+                removed?;
+
+                this.update(&mut cx, |this, cx| this.forget_linked_worktree(&path, cx))
+                    .log_err();
+                Ok(())
             },
         )
+    }
+
+    /// Drops a removed linked worktree from the snapshot. The scan that refreshes the
+    /// snapshot is triggered by a file watcher and runs later, so the removed worktree
+    /// would otherwise still be listed.
+    pub fn forget_linked_worktree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let linked_worktrees: Arc<[GitWorktree]> = self
+            .snapshot
+            .linked_worktrees
+            .iter()
+            .filter(|worktree| worktree.path != path)
+            .cloned()
+            .collect();
+        if linked_worktrees.len() != self.snapshot.linked_worktrees.len() {
+            self.snapshot.linked_worktrees = linked_worktrees;
+            cx.emit(RepositoryEvent::GitWorktreeListChanged);
+        }
     }
 
     pub fn rename_worktree(
@@ -11732,6 +11755,7 @@ fn worktree_to_proto(worktree: &git::repository::Worktree) -> proto::Worktree {
         sha: worktree.sha.to_string(),
         is_main: worktree.is_main,
         is_bare: worktree.is_bare,
+        is_prunable: worktree.is_prunable,
     }
 }
 
@@ -11746,6 +11770,7 @@ fn proto_to_worktree(proto: &proto::Worktree) -> git::repository::Worktree {
         sha: proto.sha.clone().into(),
         is_main: proto.is_main,
         is_bare: proto.is_bare,
+        is_prunable: proto.is_prunable,
     }
 }
 
@@ -13908,7 +13933,7 @@ async fn compute_snapshot(
 
     let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
         .into_iter()
-        .filter(|wt| wt.path != *work_directory_abs_path)
+        .filter(|wt| wt.path != *work_directory_abs_path && !wt.is_prunable)
         .collect();
 
     let mut remote_urls = backend.remote_urls().await;

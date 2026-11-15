@@ -1782,6 +1782,10 @@ impl SettingsUiFile {
 }
 
 impl SettingsWindow {
+    pub fn original_window(&self) -> Option<WindowHandle<MultiWorkspace>> {
+        self.original_window
+    }
+
     fn new(
         original_window: Option<WindowHandle<MultiWorkspace>>,
         window: &mut Window,

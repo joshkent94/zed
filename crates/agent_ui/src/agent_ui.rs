@@ -72,11 +72,12 @@ use workspace::Workspace;
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, ProjectError, TerminalId,
+    ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
-pub use crate::message_editor::MessageEditorEvent;
+pub use crate::message_editor::{MessageEditor, MessageEditorEvent, remap_mention_paths};
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
@@ -478,6 +479,12 @@ pub struct NewExternalAgentThread {
     #[serde(deserialize_with = "deserialize_external_agent_id")]
     agent: AgentId,
 }
+
+/// Opens a dialog to choose an agent, project, worktree, and optional first message for a new thread.
+#[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewThreadWithPrompt;
 
 fn deserialize_external_agent_id<'de, D>(deserializer: D) -> Result<AgentId, D::Error>
 where

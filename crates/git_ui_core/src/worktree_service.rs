@@ -718,6 +718,25 @@ pub struct CreatedWorktreeWorkspace {
     /// that care — like the `create_thread` agent tool — can use this to warn
     /// that the result may not reflect every source worktree's state.
     pub consolidated_worktrees: bool,
+    /// `(old_work_dir, new_worktree_path)` pairs, for use with [`remap_worktree_path`].
+    pub path_remapping: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Maps a path under a source work directory to the same path in its new worktree.
+pub fn remap_worktree_path(
+    original_path: &Path,
+    path_remapping: &[(PathBuf, PathBuf)],
+) -> Option<PathBuf> {
+    path_remapping
+        .iter()
+        .filter_map(|(old_root, new_root)| {
+            original_path
+                .strip_prefix(old_root)
+                .ok()
+                .map(|relative| (old_root.components().count(), new_root.join(relative)))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, remapped_path)| remapped_path)
 }
 
 /// Same as [`handle_create_worktree`], but returns a `Task` that resolves to
@@ -751,6 +770,26 @@ pub fn create_worktree_workspace(
         RemoteBranchFetchMode::Fetch,
         // Agent-created worktree workspaces open in the background.
         false,
+        cx,
+    )
+}
+
+/// Same as [`create_worktree_workspace`], but the new workspace is activated and
+/// inherits the source workspace's layout, like [`handle_create_worktree`].
+pub fn create_worktree_workspace_and_activate(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
+        workspace,
+        action,
+        window,
+        fallback_focused_dock,
+        RemoteBranchFetchMode::Fetch,
+        true,
         cx,
     )
 }
@@ -1092,7 +1131,7 @@ async fn do_create_worktree(
 
     let workspace = open_worktree_workspace(
         all_paths,
-        path_remapping,
+        path_remapping.clone(),
         non_git_paths,
         has_non_git,
         previous_state,
@@ -1108,6 +1147,7 @@ async fn do_create_worktree(
     Ok(CreatedWorktreeWorkspace {
         workspace,
         consolidated_worktrees,
+        path_remapping,
     })
 }
 
@@ -1290,16 +1330,9 @@ async fn open_worktree_workspace(
 
                 // Remap every previously-open file path into the new worktree.
                 let remap_path = |original_path: PathBuf| -> Option<PathBuf> {
-                    let best_match = path_remapping
-                        .iter()
-                        .filter_map(|(old_root, new_root)| {
-                            original_path.strip_prefix(old_root).ok().map(|relative| {
-                                (old_root.components().count(), new_root.join(relative))
-                            })
-                        })
-                        .max_by_key(|(depth, _)| *depth);
-
-                    if let Some((_, remapped_path)) = best_match {
+                    if let Some(remapped_path) =
+                        remap_worktree_path(&original_path, &path_remapping)
+                    {
                         return Some(remapped_path);
                     }
 
